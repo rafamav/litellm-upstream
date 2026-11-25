@@ -18,7 +18,8 @@ use litellm_redis_store::{
     system_clock,
 };
 use litellm_repositories::{
-    Database, GatewayRequestRepository, KeyRepository, ObjectPermissionRepository,
+    Database, GatewayRequestRepository, JwtKeyMappingRepository, KeyRepository,
+    ObjectPermissionRepository,
 };
 use tokio::runtime::Handle;
 
@@ -222,6 +223,7 @@ fn gateway_requests_flush(
 /// `enable_redis_auth_cache` attaches it. Every pod's evictions reach the memory whenever a
 /// coordination Redis carries them, as Python subscribes with the flag on or off.
 pub(crate) fn keys(config: &Config, redis: &RedisClients, database: Database) -> AuthStore {
+    let mappings = JwtKeyMappingRepository::new(database.clone());
     let database = KeyDatabase::new(
         Arc::new(KeyRepository::new(database.clone())),
         Arc::new(ObjectPermissionRepository::new(database)),
@@ -230,7 +232,7 @@ pub(crate) fn keys(config: &Config, redis: &RedisClients, database: Database) ->
     if let Some(client) = &redis.coordination {
         hear_evictions(&cache, client);
     }
-    AuthStore::new(cache, database)
+    AuthStore::new(cache, database, mappings)
 }
 
 /// Drops from this process's memory every key a pod evicts, Python or native, for as long as

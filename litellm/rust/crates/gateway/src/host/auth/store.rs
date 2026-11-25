@@ -3,24 +3,35 @@
 //! pod when the cache has the shared Redis attached. Nothing guards that write against an eviction
 //! that lands during the database read, as nothing guards Python's.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use litellm_auth_store::{Error, KeyDatabase};
-use litellm_gateway_auth_core::KeyHash;
+use litellm_gateway_auth_core::{KeyHash, authn::jwt::MappedClaim};
+use litellm_python_compat::Value as PyValue;
 use litellm_redis_store::{
     FromValue, IntoValue,
     auth_cache::{AuthCache, AuthObject, KeyEntry, Settings},
 };
-use litellm_repositories::Side;
+use litellm_repositories::{JwtKeyMappingRepository, Side};
+use serde_json::Value;
 
 pub struct AuthStore {
     cache: Arc<AuthCache>,
     keys: KeyDatabase,
+    mappings: JwtKeyMappingRepository,
 }
 
 impl AuthStore {
-    pub fn new(cache: Arc<AuthCache>, keys: KeyDatabase) -> Self {
-        Self { cache, keys }
+    pub fn new(
+        cache: Arc<AuthCache>,
+        keys: KeyDatabase,
+        mappings: JwtKeyMappingRepository,
+    ) -> Self {
+        Self {
+            cache,
+            keys,
+            mappings,
+        }
     }
 
     /// The key the cache holds for `hash`. A cache that fails and an entry that does not decode
@@ -73,8 +84,68 @@ impl AuthStore {
             ..self.cache.settings()
         });
     }
+
+    pub async fn cached_key_mapping(&self, claim: MappedClaim<'_>) -> Option<Value> {
+        let value = self
+            .cache
+            .get(None, &mapping_object(claim))
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    error = %litellm_error::Report::new(error),
+                    "a JWT key mapping was not read from the auth cache"
+                );
+            })
+            .ok()
+            .flatten()?;
+        match value {
+            PyValue::Str(text) => Some(Value::String(text)),
+            _ => None,
+        }
+    }
+
+    pub async fn cache_key_mapping(&self, claim: MappedClaim<'_>, value: &Value, ttl: Duration) {
+        let Some(text) = value.as_str() else {
+            return;
+        };
+        if let Err(error) = self
+            .cache
+            .set(
+                None,
+                &mapping_object(claim),
+                PyValue::Str(text.to_owned()),
+                Some(ttl),
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %litellm_error::Report::new(&error),
+                "a JWT key mapping was not cached"
+            );
+        }
+    }
+
+    pub async fn key_mapping_hash(
+        &self,
+        claim_field: &str,
+        claim_value: &str,
+        issuer: Option<&str>,
+    ) -> Result<Option<KeyHash>, litellm_db::Error> {
+        self.mappings
+            .mapped_token(claim_field, claim_value, issuer)
+            .await
+            .map(|token| token.map(KeyHash::new))
+    }
 }
 
 fn object(hash: &KeyHash) -> AuthObject {
     AuthObject::Key(hash.as_str().to_owned())
+}
+
+fn mapping_object(claim: MappedClaim<'_>) -> AuthObject {
+    AuthObject::JwtKeyMapping {
+        issuer: claim.issuer.map(str::to_owned),
+        claim_name: claim.field.to_owned(),
+        claim_value: claim.value.to_owned(),
+    }
 }

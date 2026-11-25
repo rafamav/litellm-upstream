@@ -17,7 +17,9 @@ use litellm_db::{Endpoint, Observer, PoolLimits, Pools, QueryEvent, SslMode};
 use litellm_db_testing::MigratedPostgres;
 use litellm_gateway_auth_core::Token;
 use litellm_redis_store::auth_cache::{AuthCache, Settings};
-use litellm_repositories::{Database, KeyRepository, ObjectPermissionRepository};
+use litellm_repositories::{
+    Database, JwtKeyMappingRepository, KeyRepository, ObjectPermissionRepository,
+};
 use litellm_secret_value::SecretValue;
 use serde_json::{Value, json};
 use sqlx::postgres::PgConnectOptions;
@@ -72,6 +74,22 @@ impl Held {
         self.insert("LiteLLM_VerificationToken", &row).await;
     }
 
+    /// Maps the `claim` a JWT carries as `value` to the key of `token`, for the tokens of `issuer`
+    /// or, with an empty one, of every issuer.
+    pub async fn mapping(&self, issuer: &str, claim: &str, value: &str, token: &str) {
+        let row = json!({
+            "id": format!("{issuer}/{claim}/{value}"),
+            "jwt_issuer": issuer,
+            "jwt_claim_name": claim,
+            "jwt_claim_value": value,
+            "token": Token::new(token).hash().as_str(),
+            "is_active": true,
+            "created_at": "2026-01-01T00:00:00",
+            "updated_at": "2026-01-01T00:00:00",
+        });
+        self.insert("LiteLLM_JWTKeyMapping", &row).await;
+    }
+
     /// Stores `row` in `table`, each field in the column of its name.
     pub async fn insert(&self, table: &str, row: &Value) {
         #[expect(
@@ -113,6 +131,11 @@ impl Held {
         key_database(self.repositories())
     }
 
+    /// The JWT key mapping read the gateway makes behind its auth cache.
+    pub fn mappings(&self) -> JwtKeyMappingRepository {
+        JwtKeyMappingRepository::new(self.repositories())
+    }
+
     /// How many times the key view was read through [`Self::repositories`].
     pub fn key_reads(&self) -> usize {
         self.reads.0.load(Ordering::SeqCst)
@@ -126,10 +149,19 @@ pub fn memory_cache() -> Arc<AuthCache> {
 
 /// A database nothing listens on, whose every read fails.
 pub fn unreachable() -> KeyDatabase {
-    key_database(connected(
+    key_database(nowhere())
+}
+
+/// The JWT key mapping read of a database nothing listens on.
+pub fn unreachable_mappings() -> JwtKeyMappingRepository {
+    JwtKeyMappingRepository::new(nowhere())
+}
+
+fn nowhere() -> Database {
+    connected(
         "postgres://postgres:postgres@127.0.0.1:1/postgres",
         Arc::<KeyReads>::default(),
-    ))
+    )
 }
 
 fn key_database(database: Database) -> KeyDatabase {

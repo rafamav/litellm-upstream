@@ -280,7 +280,11 @@ mod tests {
         let admit = Arc::new(Admit {
             auth: host::auth::auth(
                 &config,
-                Some(Arc::new(AuthStore::new(keys::memory_cache(), database))),
+                Some(Arc::new(AuthStore::new(
+                    keys::memory_cache(),
+                    database,
+                    keys::unreachable_mappings(),
+                ))),
             ),
             ..Admit::over(
                 &config,

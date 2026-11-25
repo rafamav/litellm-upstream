@@ -2,7 +2,8 @@
 //! each with who answers it, `rust` or `python`. A request for Python names the `reason` the client
 //! sees in `x-litellm-gateway`, and may name the setting or trait it goes to Python `over`.
 //! A request that names `jwt` claims carries them signed by a provider whose JWKS
-//! `JWT_PUBLIC_KEY_URL` names, and `jwks` says what that URL answers.
+//! `JWT_PUBLIC_KEY_URL` names, and `jwks` says what that URL answers. `mappings` lists the keys the
+//! database maps a JWT's claim to.
 
 mod jwt;
 mod keys;
@@ -31,6 +32,13 @@ struct Scenario {
     /// The `tpm_limit` of each key that holds one.
     #[serde(default)]
     tpm_limits: BTreeMap<String, i64>,
+    /// The `max_budget` of each key that holds one.
+    #[serde(default)]
+    max_budgets: BTreeMap<String, f64>,
+    /// The key each JWT claim maps to for every issuer: the claim's name, then each value it
+    /// takes with the token of its key.
+    #[serde(default)]
+    mappings: BTreeMap<String, BTreeMap<String, String>>,
     /// What boot read of the config the proxy stores in its database.
     #[serde(default)]
     stored: Stored,
@@ -128,16 +136,27 @@ fn stored_config(stored: Stored, held: Held) -> StoredConfig {
     }
 }
 
-/// The database holding each key of the scenario, a plain row with the model list and the token
-/// limit it gives.
+/// The database holding each key of the scenario, a plain row with the model list, the token
+/// limit and the budget it gives, and each claim mapped to its key.
 async fn listed(
     keys: &BTreeMap<String, Vec<String>>,
     tpm_limits: &BTreeMap<String, i64>,
+    max_budgets: &BTreeMap<String, f64>,
+    mappings: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> keys::Held {
     let held = keys::Held::start().await;
     for (token, models) in keys {
-        let columns = serde_json::json!({"models": models, "tpm_limit": tpm_limits.get(token)});
+        let columns = serde_json::json!({
+            "models": models,
+            "tpm_limit": tpm_limits.get(token),
+            "max_budget": max_budgets.get(token),
+        });
         held.key(token, columns).await;
+    }
+    for (claim, mapped) in mappings {
+        for (value, token) in mapped {
+            held.mapping("", claim, value, token).await;
+        }
     }
     held
 }
@@ -266,6 +285,8 @@ impl Sent {
 #[case::jwt_scope_based_access("jwt_scope_based_access")]
 #[case::jwt_provider_unusable("jwt_provider_unusable")]
 #[case::jwt_provider_down("jwt_provider_down")]
+#[case::jwt_key_mapping("jwt_key_mapping")]
+#[case::jwt_key_mapping_without_database("jwt_key_mapping_without_database")]
 #[tokio::test(flavor = "multi_thread")]
 async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
     litellm_gateway::install_crypto_provider();
@@ -289,7 +310,15 @@ async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
     };
     let held = match scenario.keys.is_empty() {
         true => None,
-        false => Some(listed(&scenario.keys, &scenario.tpm_limits).await),
+        false => Some(
+            listed(
+                &scenario.keys,
+                &scenario.tpm_limits,
+                &scenario.max_budgets,
+                &scenario.mappings,
+            )
+            .await,
+        ),
     };
     let state = match &held {
         None => state,
@@ -297,6 +326,7 @@ async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
             keys: Some(Arc::new(AuthStore::new(
                 keys::memory_cache(),
                 held.database(),
+                held.mappings(),
             ))),
             ..state
         },
