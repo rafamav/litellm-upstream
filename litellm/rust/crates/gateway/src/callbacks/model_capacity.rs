@@ -181,8 +181,8 @@ impl Counted {
     /// The master key names no priority class. A key names the one its row holds.
     fn of(identity: &Authenticated<NativeRows>) -> Self {
         let priority = match &identity.credential {
-            Credential::MasterKey => None,
-            Credential::Key { key } => key.priority().cloned(),
+            Credential::MasterKey | Credential::Jwt { .. } => None,
+            Credential::Key { key, .. } => key.priority().cloned(),
         };
         Self {
             key: KeyFacts {

@@ -652,7 +652,7 @@ mod tests {
     ) {
         let caller = authenticate_holding(columns).await.unwrap();
 
-        let Credential::Key { key } = &caller.credential else {
+        let Credential::Key { key, .. } = &caller.credential else {
             panic!("the key authenticated as the master key");
         };
         assert_eq!(
@@ -736,7 +736,7 @@ mod tests {
     async fn a_keys_limits_reach_its_caller(#[case] columns: Columns, #[case] limits: KeyLimits) {
         let caller = authenticate_holding(columns).await.unwrap();
 
-        let Credential::Key { key } = &caller.credential else {
+        let Credential::Key { key, .. } = &caller.credential else {
             panic!("the key authenticated as the master key");
         };
         assert_eq!(key.limits(), &limits);
@@ -748,7 +748,7 @@ mod tests {
             .await
             .unwrap();
 
-        let Credential::Key { key } = &caller.credential else {
+        let Credential::Key { key, .. } = &caller.credential else {
             panic!("the key authenticated as the master key");
         };
         assert_eq!(key.priority().map(|class| &**class), Some("prod"));

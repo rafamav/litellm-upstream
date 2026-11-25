@@ -37,8 +37,8 @@ use crate::{Gateway, callbacks, callbacks::Callbacks};
 /// it was authenticated.
 pub(crate) fn layers(identity: &Authenticated<NativeRows>) -> impl Iterator<Item = Layer<'_>> {
     let key = match &identity.credential {
-        Credential::MasterKey => None,
-        Credential::Key { key } => Some(Layer::Key(ModelList::read(key.models()))),
+        Credential::MasterKey | Credential::Jwt { .. } => None,
+        Credential::Key { key, .. } => Some(Layer::Key(ModelList::read(key.models()))),
     };
     key.into_iter()
 }
@@ -48,8 +48,8 @@ pub(crate) fn layers(identity: &Authenticated<NativeRows>) -> impl Iterator<Item
 /// Python's does by a key's `models`, special values included.
 pub(crate) fn allowed_models(identity: &Authenticated<NativeRows>) -> Vec<String> {
     match &identity.credential {
-        Credential::MasterKey => Vec::new(),
-        Credential::Key { key } => key.models().to_vec(),
+        Credential::MasterKey | Credential::Jwt { .. } => Vec::new(),
+        Credential::Key { key, .. } => key.models().to_vec(),
     }
 }
 

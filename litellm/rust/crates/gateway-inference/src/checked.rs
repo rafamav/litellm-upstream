@@ -114,8 +114,8 @@ async fn check<H: Host>(
     };
     let needs = body::needs(&request, names, policy);
     let team = match &call.identity.credential {
-        Credential::MasterKey => None,
-        Credential::Key { key } => key.record().team_id.as_deref(),
+        Credential::MasterKey | Credential::Jwt { .. } => None,
+        Credential::Key { key, .. } => key.record().team_id.as_deref(),
     };
     let reachable = Reachable {
         groups: gateway

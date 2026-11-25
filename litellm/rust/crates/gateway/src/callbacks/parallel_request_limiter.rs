@@ -235,10 +235,15 @@ impl Caller {
                 user_id: Some(PROXY_ADMIN_NAME),
                 limits: KeyLimits::default(),
             },
-            auth_core::Credential::Key { key } => Self {
+            auth_core::Credential::Key { key, .. } => Self {
                 api_key: identity.hash().map(ToString::to_string),
                 user_id: None,
                 limits: key.limits().clone(),
+            },
+            auth_core::Credential::Jwt { .. } => Self {
+                api_key: None,
+                user_id: None,
+                limits: KeyLimits::default(),
             },
         }
     }

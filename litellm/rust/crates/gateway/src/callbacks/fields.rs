@@ -55,10 +55,15 @@ pub(super) fn charged(identity: &Authenticated<NativeRows>) -> Charged {
             key_alias: None,
             user_id: Some(PROXY_ADMIN_NAME.to_owned()),
         },
-        Credential::Key { key } => Charged {
+        Credential::Key { key, .. } => Charged {
             key_hash: identity.hash().map(ToString::to_string),
             key_alias: key.alias().map(str::to_owned),
             user_id: key.record().user_id.clone(),
+        },
+        Credential::Jwt { .. } => Charged {
+            key_hash: None,
+            key_alias: None,
+            user_id: None,
         },
     }
 }
