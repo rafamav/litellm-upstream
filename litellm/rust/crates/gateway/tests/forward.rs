@@ -101,6 +101,7 @@ async fn gateway(python: SocketAddr, admits: bool, root_path: &str) -> SocketAdd
                 redis: litellm_gateway::RedisClients::default(),
                 database: None,
                 keys: None,
+                jwt_io: Arc::new(litellm_gateway::JwtIo::new(litellm_http::Client::for_test())),
                 spend_logs: None,
                 entitlements: Arc::new(Entitlements::Community),
                 environment: Arc::new(litellm_env::ProcessEnvironment),
