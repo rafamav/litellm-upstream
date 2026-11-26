@@ -15,6 +15,8 @@ pub struct UserRecord {
 pub struct TeamRecord {
     pub team_id: String,
     pub team_alias: Option<String>,
+    /// The models the team may call, which the model rule reads as the team's layer.
+    pub models: Vec<String>,
 }
 
 /// A user's row in a team.

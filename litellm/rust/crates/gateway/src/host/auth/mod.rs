@@ -11,10 +11,12 @@
 mod jwt_io;
 #[macro_use]
 mod key;
+mod affiliation;
 mod store;
 
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
+use litellm_auth_store::AliasMatch;
 use litellm_config::{Config, LitellmRole};
 use litellm_env::Lookup;
 use litellm_gateway_auth::{Auth, BearerOrXApiKey, CoreAuthenticator, SystemClock};
@@ -35,16 +37,16 @@ use litellm_gateway_auth_core::{
     },
     record::{EndUserRecord, MembershipRecord, OrgRecord, ProjectRecord, TeamRecord, UserRecord},
 };
-use litellm_redis_store::auth_cache::KeyEntry;
+use litellm_redis_store::auth_cache::{KeyEntry, UserEntry};
 use serde_json::Value;
 
 pub use jwt_io::{JwtIo, client_config as jwt_client_config};
 pub use key::Key;
-pub use store::AuthStore;
+pub use store::{Affiliations, AuthStore};
 
 /// The rows the native host hands the core: a key's, and a core record for each thing a caller
-/// belongs to. The steps that would read those records still decline, so no caller this host
-/// serves holds one yet. `Infallible` is a row this host has no record for, so no identity that
+/// belongs to. A JWT's team, membership and user are read, and a caller that holds a team still
+/// goes to Python at admit. The steps that read the other records decline. `Infallible` is a row this host has no record for, so no identity that
 /// needs one exists. The end user's record is empty for a request that names none.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeRows;
@@ -89,7 +91,8 @@ impl NativeAuthHost {
         }
     }
 
-    /// The store a JWT's key mapping is read through, which a host with no database lacks.
+    /// The store a JWT's key mapping and the rows its caller belongs to are read through, which
+    /// a host with no database lacks.
     fn store(&self, step: &'static str) -> Result<&AuthStore, Error> {
         match &self.keys {
             Some(store) => Ok(store),
@@ -114,6 +117,21 @@ fn declined<T>(step: &'static str) -> Result<T, Error> {
         "the native auth host does not serve what this request needs"
     );
     Err(Error::HostDeclined)
+}
+
+/// A read the database failed is declined, so Python answers it as it would.
+fn unless_failed<T>(
+    read: Result<T, litellm_auth_store::Error>,
+    step: &'static str,
+) -> Result<T, Error> {
+    read.or_else(|error| {
+        tracing::warn!(
+            error = %litellm_error::Report::new(&error),
+            step,
+            "the native auth host could not read what this request needs"
+        );
+        declined(step)
+    })
 }
 
 fn keyed(key: &KeyEntry) -> Result<Option<Keyed<Key>>, Error> {
@@ -353,8 +371,37 @@ impl AuthHost for NativeAuthHost {
         declined("key_owner")
     }
 
-    async fn user(&self, _: &UserLookup<'_>) -> Result<UserRead<UserRecord>, Error> {
-        declined("user")
+    /// A user read by its id. Python links the SSO id to a row that has none, backfills its
+    /// email and falls back to the SSO id and the email on a miss, so each of those declines.
+    async fn user(&self, lookup: &UserLookup<'_>) -> Result<UserRead<UserRecord>, Error> {
+        if lookup.upsert {
+            return declined("user_id_upsert");
+        }
+        let owed = |user: &UserEntry| {
+            if user.sso_user_id.is_none() && lookup.sso_user_id == Some(lookup.user_id) {
+                return Some("sso_user_id");
+            }
+            (user.user_email.is_none() && lookup.user_email.is_some()).then_some("user_email")
+        };
+        let read = self
+            .store("user")?
+            .user(lookup.user_id, |user| owed(user).is_none())
+            .await;
+        let Some(read) = read else {
+            return declined("user");
+        };
+        let Some(user) = unless_failed(read, "user")? else {
+            return match lookup.sso_user_id.or(lookup.user_email) {
+                Some(_) => declined("user"),
+                None => Ok(UserRead::Absent),
+            };
+        };
+        if let Some(write) = owed(&user) {
+            return declined(write);
+        }
+        affiliation::user(&user)
+            .map(UserRead::Found)
+            .or_else(declined)
     }
 
     async fn resolve_user_identity(
@@ -373,24 +420,54 @@ impl AuthHost for NativeAuthHost {
         declined("key_team")
     }
 
-    async fn team(&self, _: &str, _: bool) -> Result<TeamRead<TeamRecord>, Error> {
-        declined("team")
+    /// The auth store only reads, so a team the request may create declines.
+    async fn team(&self, team_id: &str, upsert: bool) -> Result<TeamRead<TeamRecord>, Error> {
+        if upsert {
+            return declined("team_id_upsert");
+        }
+        let Some(read) = self.store("team")?.team(team_id).await else {
+            return declined("team");
+        };
+        match unless_failed(read, "team")? {
+            Some(team) => affiliation::team(&team)
+                .map(TeamRead::Found)
+                .or_else(declined),
+            None => Ok(TeamRead::Absent),
+        }
     }
 
     async fn granting_team(&self, _: &str) -> Result<TeamRead<TeamRecord>, Error> {
         declined("granting_team")
     }
 
-    async fn team_by_alias(&self, _: &str) -> Result<AliasRead<TeamRecord>, Error> {
-        declined("team_by_alias")
+    async fn team_by_alias(&self, alias: &str) -> Result<AliasRead<TeamRecord>, Error> {
+        let Some(read) = self.store("team_by_alias")?.team_by_alias(alias).await else {
+            return declined("team_by_alias");
+        };
+        match unless_failed(read, "team_by_alias")? {
+            AliasMatch::Found(team) => affiliation::team(&team)
+                .map(AliasRead::Found)
+                .or_else(declined),
+            AliasMatch::Absent => Ok(AliasRead::Absent),
+            AliasMatch::Ambiguous => Ok(AliasRead::Ambiguous),
+        }
     }
 
     async fn load_team_membership(
         &self,
-        _: &str,
-        _: &str,
+        user_id: &str,
+        team_id: &str,
     ) -> Result<Option<MembershipRecord>, Error> {
-        declined("load_team_membership")
+        let store = self.store("load_team_membership")?;
+        let Some(read) = store.team_membership(user_id, team_id).await else {
+            return declined("load_team_membership");
+        };
+        match unless_failed(read, "load_team_membership")? {
+            Some(membership) => affiliation::membership(&membership)
+                .map(Some)
+                .or_else(declined),
+            None => Ok(None),
+        }
     }
 
     async fn org(&self, _: &str) -> Result<Option<Org<OrgRecord>>, Error> {
@@ -543,7 +620,11 @@ mod tests {
     use litellm_auth_store::KeyDatabase;
     use litellm_gateway_auth::{Authenticated, Error as Rejected, RequireMasterKey};
     use litellm_gateway_auth_core::{Credential, JwtActor, JwtStamp, Via};
-    use litellm_redis_store::cache_invalidation::CacheInvalidation;
+    use litellm_python_compat::Value as PyValue;
+    use litellm_redis_store::{
+        auth_cache::{AuthCache, AuthObject},
+        cache_invalidation::CacheInvalidation,
+    };
     use litellm_redis_testing::{RedisServer, eventually};
     use rstest::rstest;
     use serde_json::{Value as Columns, json};
@@ -1489,5 +1570,342 @@ mod tests {
             (read, mapped_at(599).await, mapped_at(601).await),
             (true, true, false)
         );
+    }
+
+    /// A host that reads a JWT's team, membership and user from `held` behind `cache`.
+    fn affiliated(cache: &Arc<AuthCache>, held: &Held) -> NativeAuthHost {
+        NativeAuthHost {
+            keys: Some(Arc::new(
+                AuthStore::new(cache.clone(), held.database(), held.mappings())
+                    .with_affiliations(Affiliations::new(held.repositories())),
+            )),
+            master: None,
+            jwt_io: None,
+        }
+    }
+
+    const EMAIL: &str = "user@example.com";
+
+    /// What a token that names `user-1` asks the host for, as a sign-in for `sso_user_id`
+    /// carrying `user_email`.
+    fn looking_up(
+        sso_user_id: Option<&'static str>,
+        user_email: Option<&'static str>,
+    ) -> UserLookup<'static> {
+        UserLookup {
+            user_id: "user-1",
+            user_email,
+            sso_user_id,
+            upsert: false,
+            email_verified: None,
+        }
+    }
+
+    #[rstest]
+    #[case::a_linked_user_with_its_email(
+        Some(json!({"sso_user_id": "user-1", "user_email": EMAIL})),
+        looking_up(Some("user-1"), Some(EMAIL)),
+        Ok(true),
+        true
+    )]
+    #[case::a_user_python_links_the_sso_id_to(
+        Some(json!({"user_email": EMAIL})),
+        looking_up(Some("user-1"), Some(EMAIL)),
+        Err(Error::HostDeclined),
+        false
+    )]
+    #[case::a_user_python_backfills_the_email_of(
+        Some(json!({"sso_user_id": "user-1"})),
+        looking_up(Some("user-1"), Some(EMAIL)),
+        Err(Error::HostDeclined),
+        false
+    )]
+    #[case::an_unlinked_user_the_token_is_no_sign_in_for(
+        Some(json!({"user_email": EMAIL})),
+        looking_up(None, Some(EMAIL)),
+        Ok(true),
+        true
+    )]
+    #[case::a_user_with_no_email_and_a_token_that_carries_none(
+        Some(json!({"sso_user_id": "user-1"})),
+        looking_up(Some("user-1"), None),
+        Ok(true),
+        true
+    )]
+    #[case::a_user_the_request_may_create(
+        Some(json!({"sso_user_id": "user-1", "user_email": EMAIL})),
+        UserLookup { upsert: true, ..looking_up(Some("user-1"), Some(EMAIL)) },
+        Err(Error::HostDeclined),
+        false
+    )]
+    #[case::a_user_with_a_budget_python_still_reads_from_the_cache(
+        Some(json!({"sso_user_id": "user-1", "user_email": EMAIL, "max_budget": 5.0})),
+        looking_up(Some("user-1"), Some(EMAIL)),
+        Err(Error::HostDeclined),
+        true
+    )]
+    #[case::no_row_with_a_sign_in_python_falls_back_on(
+        None,
+        looking_up(Some("user-1"), None),
+        Err(Error::HostDeclined),
+        false
+    )]
+    #[case::no_row_with_an_email_python_falls_back_on(
+        None,
+        looking_up(None, Some(EMAIL)),
+        Err(Error::HostDeclined),
+        false
+    )]
+    #[case::no_row_and_nothing_to_fall_back_on(None, looking_up(None, None), Ok(false), false)]
+    #[tokio::test]
+    async fn a_user_is_read_and_cached_natively_only_where_python_writes_nothing(
+        #[case] row: Option<Columns>,
+        #[case] lookup: UserLookup<'static>,
+        #[case] found: Result<bool, Error>,
+        #[case] cached: bool,
+    ) {
+        let held = Held::start().await;
+        if let Some(columns) = row {
+            let row = json!({"user_id": "user-1"})
+                .as_object()
+                .unwrap()
+                .clone()
+                .into_iter()
+                .chain(columns.as_object().unwrap().clone())
+                .collect();
+            held.insert_named("LiteLLM_UserTable", &Columns::Object(row))
+                .await;
+        }
+        let cache = keys::memory_cache();
+
+        let read = affiliated(&cache, &held).user(&lookup).await;
+
+        let object = AuthObject::User("user-1".to_owned());
+        assert_eq!(
+            (
+                read.map(|read| read.found().is_some()),
+                cache.get(None, &object).await.unwrap().is_some()
+            ),
+            (found, cached)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_membership_with_a_budget_is_not_native() {
+        let held = Held::start().await;
+        held.execute(PARENTS).await;
+        held.insert_named("LiteLLM_UserTable", &json!({"user_id": "user-1"}))
+            .await;
+        held.insert_named(
+            "LiteLLM_TeamMembership",
+            &json!({"user_id": "user-1", "team_id": "team", "budget_id": "budget"}),
+        )
+        .await;
+
+        let read = affiliated(&keys::memory_cache(), &held)
+            .load_team_membership("user-1", "team")
+            .await;
+
+        assert_eq!(read, Err(Error::HostDeclined));
+    }
+
+    /// `NO_TEAM_MEMBERSHIP_SENTINEL` in `litellm/proxy/common_utils/user_api_key_cache.py`.
+    const PYTHONS_WORD_FOR_NO_MEMBERSHIP: &str = "__no_team_membership__";
+
+    #[tokio::test]
+    async fn a_user_who_is_no_member_is_cached_as_the_word_python_caches_for_one() {
+        let held = Held::start().await;
+        held.execute(PARENTS).await;
+        let cache = keys::memory_cache();
+        let host = affiliated(&cache, &held);
+
+        let first = host.load_team_membership("user-1", "team").await;
+        let cached = cache.get(None, &membership_object()).await.unwrap();
+        held.insert_named("LiteLLM_UserTable", &json!({"user_id": "user-1"}))
+            .await;
+        held.insert_named(
+            "LiteLLM_TeamMembership",
+            &json!({"user_id": "user-1", "team_id": "team"}),
+        )
+        .await;
+        let second = host.load_team_membership("user-1", "team").await;
+
+        assert_eq!(
+            (first, cached, second),
+            (
+                Ok(None),
+                Some(PyValue::Str(PYTHONS_WORD_FOR_NO_MEMBERSHIP.to_owned())),
+                Ok(None)
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_word_that_is_not_pythons_for_no_membership_is_read_past() {
+        let held = Held::start().await;
+        held.execute(PARENTS).await;
+        held.insert_named("LiteLLM_UserTable", &json!({"user_id": "user-1"}))
+            .await;
+        held.insert_named(
+            "LiteLLM_TeamMembership",
+            &json!({"user_id": "user-1", "team_id": "team"}),
+        )
+        .await;
+        let cache = keys::memory_cache();
+        cache
+            .set(
+                None,
+                &membership_object(),
+                PyValue::Str("another word".to_owned()),
+                Some(Duration::from_secs(60)),
+            )
+            .await
+            .unwrap();
+
+        let read = affiliated(&cache, &held)
+            .load_team_membership("user-1", "team")
+            .await;
+
+        assert_eq!(read.map(|membership| membership.is_some()), Ok(true));
+    }
+
+    /// One of the reads a JWT's caller needs: the team `team` by its id or by its alias `alpha`,
+    /// the membership of `user-1` in it, or the user `user-1`.
+    #[derive(Clone, Copy)]
+    enum Read {
+        Team,
+        TeamByAlias,
+        Membership,
+        User,
+    }
+
+    /// Whether `host` found the row `read` names.
+    async fn found(host: &NativeAuthHost, read: Read) -> Result<bool, Error> {
+        match read {
+            Read::Team => host
+                .team("team", false)
+                .await
+                .map(|read| read.found().is_some()),
+            Read::TeamByAlias => host
+                .team_by_alias("alpha")
+                .await
+                .map(|read| matches!(read, AliasRead::Found(_))),
+            Read::Membership => host
+                .load_team_membership("user-1", "team")
+                .await
+                .map(|membership| membership.is_some()),
+            Read::User => host
+                .user(&looking_up(Some("user-1"), None))
+                .await
+                .map(|read| read.found().is_some()),
+        }
+    }
+
+    fn team_object() -> AuthObject {
+        AuthObject::Team("team".to_owned())
+    }
+
+    fn alias_object() -> AuthObject {
+        AuthObject::TeamAlias("alpha".to_owned())
+    }
+
+    fn membership_object() -> AuthObject {
+        AuthObject::TeamMembershipReservation {
+            user_id: "user-1".to_owned(),
+            team_id: "team".to_owned(),
+        }
+    }
+
+    fn user_object() -> AuthObject {
+        AuthObject::User("user-1".to_owned())
+    }
+
+    /// Whether a cached entry carries a read time no earlier than `since`, as `cache_team_object`
+    /// stamps a team.
+    fn is_stamped_since(entry: &PyValue, since: f64) -> bool {
+        let PyValue::Dict(fields) = entry else {
+            return false;
+        };
+        fields.iter().any(|field| {
+            matches!(
+                field,
+                (PyValue::Str(name), PyValue::Float(at)) if name == "last_refreshed_at" && *at >= since
+            )
+        })
+    }
+
+    #[rstest]
+    #[case::a_team_under_its_id_with_the_time_it_was_read(Read::Team, team_object(), true)]
+    #[case::a_team_read_by_alias_under_the_alias(Read::TeamByAlias, alias_object(), false)]
+    #[case::a_team_read_by_alias_under_its_id(Read::TeamByAlias, team_object(), false)]
+    #[case::a_membership(Read::Membership, membership_object(), false)]
+    #[case::a_user(Read::User, user_object(), false)]
+    #[tokio::test]
+    async fn a_row_read_from_the_database_is_cached_where_python_reads_it(
+        #[case] read: Read,
+        #[case] object: AuthObject,
+        #[case] stamped: bool,
+    ) {
+        let held = Held::start().await;
+        held.insert_named(
+            "LiteLLM_TeamTable",
+            &json!({"team_id": "team", "team_alias": "alpha"}),
+        )
+        .await;
+        held.insert_named(
+            "LiteLLM_UserTable",
+            &json!({"user_id": "user-1", "sso_user_id": "user-1"}),
+        )
+        .await;
+        held.insert_named(
+            "LiteLLM_TeamMembership",
+            &json!({"user_id": "user-1", "team_id": "team"}),
+        )
+        .await;
+        let cache = keys::memory_cache();
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        let found = found(&affiliated(&cache, &held), read).await;
+
+        let cached = cache.get(None, &object).await.unwrap();
+        assert_eq!(
+            (
+                found,
+                cached.as_ref().map(|entry| is_stamped_since(entry, before))
+            ),
+            (Ok(true), Some(stamped))
+        );
+    }
+
+    #[rstest]
+    #[case::a_team(Read::Team, team_object(), json!({"team_id": "team"}))]
+    #[case::a_team_by_alias(
+        Read::TeamByAlias,
+        alias_object(),
+        json!({"team_id": "team", "team_alias": "alpha"})
+    )]
+    #[case::a_membership(
+        Read::Membership,
+        membership_object(),
+        json!({"user_id": "user-1", "team_id": "team"})
+    )]
+    #[case::a_user(Read::User, user_object(), json!({"user_id": "user-1", "sso_user_id": "user-1"}))]
+    #[tokio::test]
+    async fn a_cached_row_is_found_though_the_database_holds_none(
+        #[case] read: Read,
+        #[case] object: AuthObject,
+        #[case] entry: Columns,
+    ) {
+        let held = Held::start().await;
+        let cache = keys::memory_cache();
+        let entry = litellm_python_compat::json::loads(&entry.to_string()).unwrap();
+        cache.set(None, &object, entry, None).await.unwrap();
+
+        let found = found(&affiliated(&cache, &held), read).await;
+
+        assert_eq!(found, Ok(true));
     }
 }

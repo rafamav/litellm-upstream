@@ -23,7 +23,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use litellm_gateway_auth::Authenticated;
 use litellm_gateway_auth_core::{
-    Credential,
+    Credential, Team,
     authz::{Layer, ModelList},
     body::{self, Credentials},
 };
@@ -32,25 +32,38 @@ use tokio::sync::OnceCell;
 
 use crate::{Gateway, callbacks, callbacks::Callbacks};
 
-/// The model lists the native host read for `identity`: a key's own, and none for the master
-/// key. A key that names a team, an owner or anything else that carries a list was declined when
-/// it was authenticated.
+/// The model lists the native host read for `identity`: a key's own, a JWT's team's, and none for
+/// the master key. A key that names a team, an owner or anything else that carries a list was
+/// declined when it was authenticated.
 pub(crate) fn layers(identity: &Authenticated<NativeRows>) -> impl Iterator<Item = Layer<'_>> {
     let key = match &identity.credential {
         Credential::MasterKey | Credential::Jwt { .. } => None,
         Credential::Key { key, .. } => Some(Layer::Key(ModelList::read(key.models()))),
     };
-    key.into_iter()
+    let team = team_models(identity).map(|models| Layer::Team(ModelList::read(models)));
+    key.into_iter().chain(team)
 }
 
-/// Every entry of the model lists the native host read for `identity`, as their rows hold them.
-/// The router narrows a caller that reaches a model only through an access group by these, as
-/// Python's does by a key's `models`, special values included.
-pub(crate) fn allowed_models(identity: &Authenticated<NativeRows>) -> Vec<String> {
-    match &identity.credential {
-        Credential::MasterKey | Credential::Jwt { .. } => Vec::new(),
-        Credential::Key { key, .. } => key.models().to_vec(),
+/// The list of the team `identity` acts in, as its row holds it. A team the token names with no
+/// row behind it has none, as Python checks no team it holds no object for. Only a key holds a
+/// copy of its team, and the host declines every key in a team, so no caller holds one.
+fn team_models(identity: &Authenticated<NativeRows>) -> Option<&[String]> {
+    match identity.affiliation.holder.team()? {
+        Team::Row(record) => Some(&record.models),
+        Team::KeyCopy(_) | Team::Unstored(_) => None,
     }
+}
+
+/// Every entry of the model lists the native host read for `identity`, as their rows hold them:
+/// the key's and then its team's. The router narrows a caller that reaches a model only through
+/// an access group by these, as Python's does by a key's `models` plus its `team_models`, special
+/// values included.
+pub(crate) fn allowed_models(identity: &Authenticated<NativeRows>) -> Vec<String> {
+    let key = match &identity.credential {
+        Credential::MasterKey | Credential::Jwt { .. } => &[][..],
+        Credential::Key { key, .. } => key.models(),
+    };
+    [key, team_models(identity).unwrap_or_default()].concat()
 }
 
 /// The host the gateway's routes are served through, over each deployment's context window as
@@ -108,5 +121,107 @@ impl Host for NativeHost {
             windows: &self.windows,
             prompt_tokens: OnceCell::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use litellm_config::LitellmRole;
+    use litellm_gateway_auth_core::{
+        Affiliation, Caller, Holder, JwtActor, JwtStamp, Via, record::TeamRecord,
+    };
+    use rstest::rstest;
+
+    use super::{auth::Key, *};
+
+    fn in_team(
+        credential: Credential<NativeRows>,
+        team: Option<Team<NativeRows>>,
+    ) -> Authenticated<NativeRows> {
+        Authenticated::from(Caller {
+            credential,
+            affiliation: Affiliation {
+                holder: Holder::new(None, team.map(|team| (team, None))),
+                org: None,
+                project: None,
+            },
+            end_user: None,
+        })
+    }
+
+    fn jwt_in(team: Option<Team<NativeRows>>) -> Authenticated<NativeRows> {
+        let credential = Credential::Jwt {
+            jwt: JwtStamp {
+                claims: serde_json::Map::new(),
+                user_email: None,
+            },
+            actor: JwtActor::User {
+                role: LitellmRole::InternalUser,
+            },
+        };
+        in_team(credential, team)
+    }
+
+    fn row(models: &[&str]) -> Team<NativeRows> {
+        Team::Row(TeamRecord {
+            team_id: "team-1".to_owned(),
+            team_alias: None,
+            models: owned(models),
+        })
+    }
+
+    fn owned(models: &[&str]) -> Vec<String> {
+        models.iter().map(|model| (*model).to_owned()).collect()
+    }
+
+    #[rstest]
+    #[case::a_team_that_names_its_models(Some(row(&["claude"])), Some(&["claude"][..]))]
+    #[case::a_team_with_no_list(Some(row(&[])), Some(&[][..]))]
+    #[case::a_team_no_row_stands_behind(Some(Team::Unstored("team-1".to_owned())), None)]
+    #[case::no_team(None, None)]
+    fn a_jwt_is_checked_against_its_teams_list(
+        #[case] team: Option<Team<NativeRows>>,
+        #[case] listed: Option<&[&str]>,
+    ) {
+        let identity = jwt_in(team);
+        let listed = listed.map(owned);
+
+        assert_eq!(
+            (
+                layers(&identity).collect::<Vec<_>>(),
+                allowed_models(&identity)
+            ),
+            (
+                listed
+                    .iter()
+                    .map(|models| Layer::Team(ModelList::read(models)))
+                    .collect(),
+                listed.clone().unwrap_or_default()
+            )
+        );
+    }
+
+    #[test]
+    fn a_keys_list_is_read_before_its_teams() {
+        let credential = Credential::Key {
+            key: Key::listing(&["claude"]),
+            via: Via::OwnToken,
+        };
+        let identity = in_team(credential, Some(row(&["haiku"])));
+        let (key, team) = (owned(&["claude"]), owned(&["haiku"]));
+
+        assert_eq!(
+            (
+                layers(&identity).collect::<Vec<_>>(),
+                allowed_models(&identity)
+            ),
+            (
+                vec![
+                    Layer::Key(ModelList::read(&key)),
+                    Layer::Team(ModelList::read(&team))
+                ],
+                owned(&["claude", "haiku"])
+            )
+        );
     }
 }

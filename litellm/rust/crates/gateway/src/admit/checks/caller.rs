@@ -6,12 +6,14 @@ use super::{Admit, Authentication, Reason, Refused, head::TEAM_HEADER};
 
 /// Each caller the core hands back is matched by name, with no catch-all, so a caller the native
 /// host learns to serve does not compile here until it is named native or not. A credential the
-/// core did not authenticate is over the error's name. A JWT is checked against its scope mappings
-/// only for the model the request names, which the core is not handed before the body is read.
+/// core did not authenticate is over the error's name, which for a JWT includes every decision
+/// that reads the model, since the core is not handed one before the body is read. A key a JWT
+/// maps to takes the key path, so its scope mappings are refused here.
 /// With a customer claim mapped, Python resolves the customer a verified JWT names after auth, and
 /// applies that customer's budgets and models, which the native app does not.
 /// Only the JWT path reads the team header, and Python code after auth reads it beside a key, so a
-/// key that sends one stays with Python, a key a JWT maps to included.
+/// key that sends one stays with Python, a key a JWT maps to included. A JWT whose caller belongs
+/// to a team or names a user stays with Python too, since the native spend log charges neither yet.
 pub(super) fn caller(
     admit: &Admit,
     request: &Parts,
@@ -39,7 +41,14 @@ pub(super) fn caller(
             } => team_header()
                 .or_else(scope_mappings)
                 .or_else(|| customer_claims(admit)),
-            Credential::Jwt { .. } => scope_mappings().or_else(|| customer_claims(admit)),
+            Credential::Jwt { .. } => customer_claims(admit).or_else(|| {
+                let holder = &caller.affiliation.holder;
+                let charged = holder
+                    .team()
+                    .map(|_| "team")
+                    .or_else(|| holder.user().map(|_| "user"))?;
+                Some(Reason::new(Refused::Credential, charged))
+            }),
         },
         Err(error) => Some(Reason::new(
             Refused::Credential,

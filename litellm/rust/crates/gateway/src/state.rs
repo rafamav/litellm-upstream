@@ -30,7 +30,7 @@ use crate::{
     gateway_requests::GatewayRequests,
     host::{
         self, NativeRows,
-        auth::{AuthStore, JwtIo},
+        auth::{Affiliations, AuthStore, JwtIo},
     },
     license::build_license,
     periodic::{self, PeriodicJob},
@@ -224,7 +224,8 @@ fn gateway_requests_flush(
 /// coordination Redis carries them, as Python subscribes with the flag on or off.
 pub(crate) fn keys(config: &Config, redis: &RedisClients, database: Database) -> AuthStore {
     let mappings = JwtKeyMappingRepository::new(database.clone());
-    let database = KeyDatabase::new(
+    let affiliations = Affiliations::new(database.clone());
+    let keys = KeyDatabase::new(
         Arc::new(KeyRepository::new(database.clone())),
         Arc::new(ObjectPermissionRepository::new(database)),
     );
@@ -232,7 +233,7 @@ pub(crate) fn keys(config: &Config, redis: &RedisClients, database: Database) ->
     if let Some(client) = &redis.coordination {
         hear_evictions(&cache, client);
     }
-    AuthStore::new(cache, database, mappings)
+    AuthStore::new(cache, keys, mappings).with_affiliations(affiliations)
 }
 
 /// Drops from this process's memory every key a pod evicts, Python or native, for as long as

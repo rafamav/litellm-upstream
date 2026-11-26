@@ -16,7 +16,10 @@ use axum::{
     http::Method,
 };
 use litellm_config::{Config, Environment};
-use litellm_gateway::{StoredConfig, host::auth::AuthStore};
+use litellm_gateway::{
+    StoredConfig,
+    host::auth::{Affiliations, AuthStore},
+};
 use litellm_license::Entitlements;
 use litellm_model_catalog::{CostMap, IntegrityLimits};
 use litellm_repositories::StoredObjects;
@@ -29,6 +32,12 @@ struct Scenario {
     /// The virtual keys the database holds, each token with its model list.
     #[serde(default)]
     keys: BTreeMap<String, Vec<String>>,
+    /// The teams the database holds, each id with the columns set on its row.
+    #[serde(default)]
+    teams: BTreeMap<String, Columns>,
+    /// The users the database holds, each id with the columns set on its row.
+    #[serde(default)]
+    users: BTreeMap<String, Columns>,
     /// The `tpm_limit` of each key that holds one.
     #[serde(default)]
     tpm_limits: BTreeMap<String, i64>,
@@ -136,13 +145,18 @@ fn stored_config(stored: Stored, held: Held) -> StoredConfig {
     }
 }
 
+/// The columns a scenario sets on a row, each by its name.
+type Columns = serde_json::Map<String, serde_json::Value>;
+
 /// The database holding each key of the scenario, a plain row with the model list, the token
-/// limit and the budget it gives, and each claim mapped to its key.
+/// limit and the budget it gives, each claim mapped to its key, and each team and user.
 async fn listed(
     keys: &BTreeMap<String, Vec<String>>,
     tpm_limits: &BTreeMap<String, i64>,
     max_budgets: &BTreeMap<String, f64>,
     mappings: &BTreeMap<String, BTreeMap<String, String>>,
+    teams: &BTreeMap<String, Columns>,
+    users: &BTreeMap<String, Columns>,
 ) -> keys::Held {
     let held = keys::Held::start().await;
     for (token, models) in keys {
@@ -156,6 +170,19 @@ async fn listed(
     for (claim, mapped) in mappings {
         for (value, token) in mapped {
             held.mapping("", claim, value, token).await;
+        }
+    }
+    let tables = [
+        ("LiteLLM_TeamTable", "team_id", teams),
+        ("LiteLLM_UserTable", "user_id", users),
+    ];
+    for (table, id_column, rows) in tables {
+        for (id, columns) in rows {
+            let row = std::iter::once((id_column.to_owned(), serde_json::json!(id)))
+                .chain(columns.clone())
+                .collect();
+            held.insert_named(table, &serde_json::Value::Object(row))
+                .await;
         }
     }
     held
@@ -287,6 +314,10 @@ impl Sent {
 #[case::jwt_provider_down("jwt_provider_down")]
 #[case::jwt_key_mapping("jwt_key_mapping")]
 #[case::jwt_key_mapping_without_database("jwt_key_mapping_without_database")]
+#[case::jwt_team_header("jwt_team_header")]
+#[case::jwt_team_alias("jwt_team_alias")]
+#[case::jwt_team_id_upsert("jwt_team_id_upsert")]
+#[case::jwt_user_claim("jwt_user_claim")]
 #[tokio::test(flavor = "multi_thread")]
 async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
     litellm_gateway::install_crypto_provider();
@@ -308,7 +339,9 @@ async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
             ..state
         },
     };
-    let held = match scenario.keys.is_empty() {
+    let stores_nothing =
+        scenario.keys.is_empty() && scenario.teams.is_empty() && scenario.users.is_empty();
+    let held = match stores_nothing {
         true => None,
         false => Some(
             listed(
@@ -316,6 +349,8 @@ async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
                 &scenario.tpm_limits,
                 &scenario.max_budgets,
                 &scenario.mappings,
+                &scenario.teams,
+                &scenario.users,
             )
             .await,
         ),
@@ -323,11 +358,10 @@ async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
     let state = match &held {
         None => state,
         Some(held) => litellm_gateway::AppState {
-            keys: Some(Arc::new(AuthStore::new(
-                keys::memory_cache(),
-                held.database(),
-                held.mappings(),
-            ))),
+            keys: Some(Arc::new(
+                AuthStore::new(keys::memory_cache(), held.database(), held.mappings())
+                    .with_affiliations(Affiliations::new(held.repositories())),
+            )),
             ..state
         },
     };

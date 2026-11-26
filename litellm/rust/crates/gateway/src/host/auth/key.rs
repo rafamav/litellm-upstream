@@ -12,7 +12,10 @@ use litellm_gateway_auth_core::{
     authz::ModelList,
 };
 use litellm_python_compat::{Value, datetime::IsoDateTime, json};
-use litellm_redis_store::auth_cache::{Bag, KeyEntry, Lists, ModelRegion, ObjectPermissionEntry};
+use litellm_redis_store::auth_cache::{
+    Bag, BudgetFullEntry, ExcludedIfNone, KeyEntry, Lists, ModelRegion, ModelTableEntry,
+    ObjectPermissionEntry,
+};
 use serde::Deserialize;
 
 use crate::callbacks::parallel_request_limiter::{KeyLimits, ModelLimits};
@@ -58,8 +61,16 @@ carried_when_held!(
     IsoDateTime,
     LitellmRole,
     ModelRegion,
-    ObjectPermissionEntry
+    ObjectPermissionEntry,
+    ModelTableEntry,
+    BudgetFullEntry
 );
+
+impl<T: Carried> Carried for ExcludedIfNone<T> {
+    fn is_carried(&self) -> bool {
+        self.0.is_carried()
+    }
+}
 
 impl<T> Carried for Vec<T> {
     fn is_carried(&self) -> bool {
@@ -134,6 +145,22 @@ impl Key {
 
     pub(crate) fn alias(&self) -> Option<&str> {
         self.alias.as_deref()
+    }
+}
+
+#[cfg(test)]
+impl Key {
+    /// A key that holds nothing beside its `models`.
+    pub(crate) fn listing(models: &[&str]) -> Self {
+        Self {
+            record: KeyRecord::default(),
+            models: models.iter().map(|model| (*model).to_owned()).collect(),
+            limits: KeyLimits::default(),
+            priority: None,
+            alias: None,
+            budget: None,
+            aliased: false,
+        }
     }
 }
 
