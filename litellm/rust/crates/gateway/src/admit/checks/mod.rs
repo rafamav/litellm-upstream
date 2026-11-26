@@ -42,11 +42,13 @@ impl Reason {
 pub(super) type Authentication = Result<Authenticated<NativeRows>, litellm_gateway_auth::Error>;
 pub(super) type Fields = Map<String, Value>;
 
+type CallerCheck = fn(&Admit, &Parts, &Authentication) -> Option<Reason>;
+
 pub(super) const HEAD: &[fn(&Admit, &Parts) -> Option<Reason>] = &[
     config::settings,
     head::route,
     head::forwarded_for,
     head::headers,
 ];
-pub(super) const CALLER: &[fn(&Admit, &Authentication) -> Option<Reason>] = &[caller::caller];
+pub(super) const CALLER: &[CallerCheck] = &[caller::caller];
 pub(super) const BODY: &[fn(&Admit, &Fields) -> Option<Reason>] = &[body::fields, model::model];

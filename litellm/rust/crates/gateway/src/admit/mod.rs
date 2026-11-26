@@ -197,7 +197,7 @@ impl Admit {
         let authenticated = self.auth.authenticate_parts(&parts).await;
         if let Some(reason) = checks::CALLER
             .iter()
-            .find_map(|check| check(&self, &authenticated))
+            .find_map(|check| check(&self, &parts, &authenticated))
         {
             return Err(refused(parts, body, reason));
         }

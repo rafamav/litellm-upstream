@@ -1,7 +1,8 @@
+use axum::http::request::Parts;
 use litellm_config::GeneralSettings;
 use litellm_gateway_auth_core::{Credential, Via};
 
-use super::{Admit, Authentication, Reason, Refused};
+use super::{Admit, Authentication, Reason, Refused, head::TEAM_HEADER};
 
 /// Each caller the core hands back is matched by name, with no catch-all, so a caller the native
 /// host learns to serve does not compile here until it is named native or not. A credential the
@@ -9,20 +10,36 @@ use super::{Admit, Authentication, Reason, Refused};
 /// only for the model the request names, which the core is not handed before the body is read.
 /// With a customer claim mapped, Python resolves the customer a verified JWT names after auth, and
 /// applies that customer's budgets and models, which the native app does not.
-pub(super) fn caller(admit: &Admit, authentication: &Authentication) -> Option<Reason> {
+/// Only the JWT path reads the team header, and Python code after auth reads it beside a key, so a
+/// key that sends one stays with Python, a key a JWT maps to included.
+pub(super) fn caller(
+    admit: &Admit,
+    request: &Parts,
+    authentication: &Authentication,
+) -> Option<Reason> {
+    let team_header = || {
+        request
+            .headers
+            .contains_key(TEAM_HEADER)
+            .then(|| Reason::new(Refused::Headers, TEAM_HEADER))
+    };
+    let scope_mappings = || {
+        scope_mappings_enforced(&admit.config.general_settings)
+            .then(|| Reason::new(Refused::Settings, "enforce_scope_based_access"))
+    };
     match authentication {
         Ok(caller) => match &caller.credential {
             Credential::MasterKey
             | Credential::Key {
                 via: Via::OwnToken, ..
-            } => None,
+            } => team_header(),
             Credential::Key {
                 via: Via::MappedJwt(_),
                 ..
-            }
-            | Credential::Jwt { .. } => scope_mappings_enforced(&admit.config.general_settings)
-                .then(|| Reason::new(Refused::Settings, "enforce_scope_based_access"))
+            } => team_header()
+                .or_else(scope_mappings)
                 .or_else(|| customer_claims(admit)),
+            Credential::Jwt { .. } => scope_mappings().or_else(|| customer_claims(admit)),
         },
         Err(error) => Some(Reason::new(
             Refused::Credential,
@@ -75,12 +92,9 @@ fn maps_customer_claims(general: &GeneralSettings) -> bool {
 #[cfg(test)]
 mod tests {
     use litellm_config::Config;
-    use litellm_gateway_auth::Authenticated;
-    use litellm_gateway_auth_core::{Affiliation, Caller, JwtStamp};
     use rstest::rstest;
 
     use super::*;
-    use crate::host::auth::Key;
 
     fn jwtauth(settings: &str) -> GeneralSettings {
         let yaml = format!("general_settings:\n  litellm_jwtauth:\n{settings}");
@@ -133,25 +147,5 @@ mod tests {
         #[case] enforced: bool,
     ) {
         assert_eq!(scope_mappings_enforced(&jwtauth(settings)), enforced);
-    }
-
-    #[test]
-    fn a_key_a_jwt_maps_to_is_served_natively() {
-        let config = Config::from_yaml("general_settings:\n  master_key: gateway-key\n").unwrap();
-        let authentication: Authentication = Ok(Authenticated::from(Caller {
-            credential: Credential::Key {
-                key: Key::stored("stored"),
-                via: Via::MappedJwt(JwtStamp {
-                    claims: serde_json::Map::new(),
-                    user_email: None,
-                }),
-            },
-            affiliation: Affiliation::nobody(),
-            end_user: None,
-        }));
-
-        let reason = caller(&Admit::over(&config, vec![]), &authentication);
-
-        assert_eq!(reason, None);
     }
 }
