@@ -395,23 +395,34 @@ async def test_saved_cimd_identity_refreshes_without_discovery(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_invalid_grant_is_an_unauthorized_refresh_outcome():
+async def test_invalid_grant_revokes_only_the_failed_credential_generation():
     from litellm.proxy.mcp_server.outbound_credentials.authz_code_refresher import AuthorizationCodeTokenDenied
+
+    revoked = []
 
     async def endpoint(url: str, form: dict[str, str], headers: dict[str, str]):
         return AuthorizationCodeTokenDenied(
             status_code=400, body={"error": "invalid_grant"}, detail="token endpoint returned HTTP 400"
         )
 
-    refresher = AuthorizationCodeRefresher(_lookup(_Server()), endpoint, _recording_persist([]))
+    async def revoke(user_id, server_id, access_token, refresh_token):
+        revoked.append((user_id, server_id, access_token, refresh_token))
+
+    refresher = AuthorizationCodeRefresher(_lookup(_Server()), endpoint, _recording_persist([]), revoke=revoke)
     outcome = await refresher.refresh("alice", "srv", OAuthToken("old-at", refresh_token="dead-rt"))
     assert isinstance(outcome, Error)
     assert outcome.error.tag == "unauthorized"
+    assert revoked == [("alice", "srv", "old-at", "dead-rt")]
 
 
 @pytest.mark.asyncio
-async def test_transient_and_client_refresh_failures_keep_their_error_classes():
+async def test_transient_and_client_refresh_failures_never_revoke_the_grant():
     from litellm.proxy.mcp_server.outbound_credentials.authz_code_refresher import AuthorizationCodeTokenDenied
+
+    revoked = []
+
+    async def revoke(user_id, server_id, access_token, refresh_token):
+        revoked.append((user_id, server_id, access_token, refresh_token))
 
     for status, body, expected in (
         (500, {"error": "temporarily_unavailable"}, "upstream_unavailable"),
@@ -424,7 +435,8 @@ async def test_transient_and_client_refresh_failures_keep_their_error_classes():
         async def endpoint(url: str, form: dict[str, str], headers: dict[str, str], status=status, body=body):
             return AuthorizationCodeTokenDenied(status_code=status, body=body, detail="denied")
 
-        refresher = AuthorizationCodeRefresher(_lookup(_Server()), endpoint, _recording_persist([]))
+        refresher = AuthorizationCodeRefresher(_lookup(_Server()), endpoint, _recording_persist([]), revoke=revoke)
         outcome = await refresher.refresh("alice", "srv", OAuthToken("old-at", refresh_token="rt"))
         assert isinstance(outcome, Error)
         assert outcome.error.tag == expected
+    assert revoked == []

@@ -32,7 +32,9 @@ from litellm.proxy.common_utils.encrypt_decrypt_utils import (
 from litellm.proxy.mcp_server.db import (
     OAuthCredentialPayload,
     _decode_user_credential,
+    _postgres_schema_name,
     _prepare_mcp_server_data,
+    _quoted_postgres_schema,
     create_mcp_server,
     decrypt_credentials,
     encrypt_credentials,
@@ -41,7 +43,9 @@ from litellm.proxy.mcp_server.db import (
     get_mcp_submissions,
     get_user_credential,
     get_user_oauth_credential,
+    invalidate_user_oauth_credential_if_grant_matches,
     is_oauth_credential_expired,
+    list_server_user_credentials,
     list_user_oauth_credentials,
     record_oauth_scope_refusal,
     refresh_user_oauth_token,
@@ -958,6 +962,75 @@ async def test_saving_a_grant_drops_the_refusal_note(
 
 
 @pytest.mark.asyncio
+async def test_invalidation_keeps_the_grant_generation_so_a_landed_rotation_can_be_saved(
+    credentials_prisma: SimpleNamespace,
+) -> None:
+    await store_user_oauth_credential(credentials_prisma, "alice", "srv-1", "at-old", refresh_token="rt-old")
+
+    invalidated: Final = await invalidate_user_oauth_credential_if_grant_matches(
+        credentials_prisma, "alice", "srv-1", "at-old", "rt-old"
+    )
+    assert invalidated is True
+    poisoned: Final = await get_user_oauth_credential(credentials_prisma, "alice", "srv-1", include_invalidated=True)
+    assert poisoned is not None
+    assert (poisoned["access_token"], poisoned["refresh_token"]) == ("", "rt-old")
+    assert await get_user_oauth_credential(credentials_prisma, "alice", "srv-1") is None
+    invalidated_metadata: Final = await get_user_oauth_credential(
+        credentials_prisma, "alice", "srv-1", include_invalidated=True
+    )
+    assert invalidated_metadata is not None and invalidated_metadata["refresh_token"] == "rt-old"
+
+    stored: Final = await store_user_oauth_credential(
+        credentials_prisma,
+        "alice",
+        "srv-1",
+        "at-new",
+        refresh_token="rt-new",
+        refreshed_from="rt-old",
+    )
+    assert stored is True
+    grant: Final = await _saved_grant(credentials_prisma)
+    assert (grant["access_token"], grant["refresh_token"]) == ("at-new", "rt-new")
+
+
+@pytest.mark.asyncio
+async def test_invalidated_grants_are_absent_from_user_and_admin_credential_surfaces() -> None:
+    row: Final = MagicMock()
+    row.user_id = "alice"
+    row.server_id = "srv-1"
+    row.updated_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    row.credential_b64 = encrypt_value_helper(
+        json.dumps(
+            {"type": "oauth2", "access_token": "", "refresh_token": "rt-old", "expires_at": "2025-01-01T01:00:00Z"}
+        )
+    )
+    table: Final = SimpleNamespace(
+        find_unique=AsyncMock(return_value=row),
+        find_many=AsyncMock(return_value=[row]),
+    )
+    prisma: Final = SimpleNamespace(db=SimpleNamespace(litellm_mcpusercredentials=table))
+
+    assert await get_user_oauth_credential(prisma, "alice", "srv-1") is None
+    assert await list_user_oauth_credentials(prisma, "alice") == []
+    assert await list_server_user_credentials(prisma, "srv-1") == ()
+    invalidated_metadata: Final = await get_user_oauth_credential(prisma, "alice", "srv-1", include_invalidated=True)
+    assert invalidated_metadata is not None and invalidated_metadata["refresh_token"] == "rt-old"
+
+
+@pytest.mark.asyncio
+async def test_invalidation_cannot_poison_a_replacement_grant(credentials_prisma: SimpleNamespace) -> None:
+    await store_user_oauth_credential(credentials_prisma, "alice", "srv-1", "at-old", refresh_token="rt-old")
+    await store_user_oauth_credential(credentials_prisma, "alice", "srv-1", "at-new", refresh_token="rt-new")
+
+    invalidated: Final = await invalidate_user_oauth_credential_if_grant_matches(
+        credentials_prisma, "alice", "srv-1", "at-old", "rt-old"
+    )
+    assert invalidated is False
+    grant: Final = await _saved_grant(credentials_prisma)
+    assert (grant["access_token"], grant["refresh_token"]) == ("at-new", "rt-new")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("interleaving", ["none", "refusal", "signin", "expired_signin", "delete"])
 @pytest.mark.parametrize("legacy", [False, True])
 async def test_refresh_preserves_refusals_without_replacing_a_new_signin(
@@ -1020,7 +1093,7 @@ async def test_refresh_preserves_refusals_without_replacing_a_new_signin(
     assert (
         None if saved is None else (saved["access_token"], saved["refresh_token"], saved.get("needs_scopes"))
     ) == expected[interleaving]
-    same_consent: Final = saved is not None and saved.get("connected_at") == before["connected_at"]
+    same_consent: Final = saved is not None and saved.get("grant_id") == before["grant_id"]
     assert same_consent == (interleaving in ("none", "refusal"))
 
 
@@ -2109,3 +2182,15 @@ async def test_silent_refresh_preserves_omitted_scope_but_accepts_explicit_grant
         },
     )
     assert db_mod.store_user_oauth_credential.await_args.kwargs["scopes"] == expected
+
+
+def test_oauth_raw_lock_sql_uses_the_database_schema_environment(monkeypatch):
+    monkeypatch.setenv("DATABASE_SCHEMA", 'tenant"schema')
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    assert _quoted_postgres_schema() == '"tenant""schema"'
+
+
+def test_oauth_raw_lock_sql_reads_the_schema_query_parameter(monkeypatch):
+    monkeypatch.delenv("DATABASE_SCHEMA", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@host/db?schema=tenant_schema")
+    assert _postgres_schema_name() == "tenant_schema"

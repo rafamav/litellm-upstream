@@ -80,6 +80,9 @@ class CredentialPersist(Protocol):
     ) -> bool | None: ...
 
 
+CredentialRevoker: TypeAlias = Callable[[str, str, str, str | None], Awaitable[None]]
+
+
 def _parse_expires_in(raw: object) -> int | None:
     if isinstance(raw, bool):
         return None
@@ -115,12 +118,14 @@ class AuthorizationCodeRefresher:
         token_endpoint: TokenEndpointPost,
         persist: CredentialPersist,
         *,
+        revoke: CredentialRevoker | None = None,
         clock: Callable[[], float] = time.time,
         identity_validator: BindingValidator = enforce_oauth_identity_binding,
     ) -> None:
         self._server_lookup = server_lookup
         self._token_endpoint = token_endpoint
         self._persist = persist
+        self._revoke = revoke
         self._clock = clock
         self._identity_validator = identity_validator
 
@@ -136,6 +141,7 @@ class AuthorizationCodeRefresher:
 
     async def _refresh(self, user_id: str, server_id: str, token: OAuthToken) -> Result[OAuthToken, CredError]:
         if token.refresh_token is None:
+            await self._revoke_dead_grant(user_id, server_id, token)
             return Error(CredError.of_unauthorized("Authorization required: complete the OAuth flow for this server."))
         server: Final = self._server_lookup(server_id)
         if server is None:
@@ -178,6 +184,8 @@ class AuthorizationCodeRefresher:
                 )
             case AuthorizationCodeTokenDenied():
                 failure: Final = self._classified_denial(outcome)
+                if failure.tag == "unauthorized":
+                    await self._revoke_dead_grant(user_id, server_id, token)
                 return Error(failure)
             case AuthorizationCodeTokenSuccess():
                 body: Final = outcome.body or {}
@@ -223,6 +231,10 @@ class AuthorizationCodeRefresher:
                 cimd_client_id=cimd_client_id,
             )
         )
+
+    async def _revoke_dead_grant(self, user_id: str, server_id: str, token: OAuthToken) -> None:
+        if self._revoke is not None:
+            await self._revoke(user_id, server_id, token.access_token, token.refresh_token)
 
     def _classified_denial(self, outcome: AuthorizationCodeTokenDenied) -> CredError:
         error: Final = outcome.body.get("error")
