@@ -63,6 +63,7 @@ AuthorizationCodeTokenOutcome: TypeAlias = (
     AuthorizationCodeTokenSuccess | AuthorizationCodeTokenDenied | AuthorizationCodeTokenUnreachable
 )
 TokenEndpointPost: TypeAlias = Callable[[str, dict[str, str], dict[str, str]], Awaitable[AuthorizationCodeTokenOutcome]]
+CredentialRevoker: TypeAlias = Callable[[str, str, str, str | None], Awaitable[None]]
 
 
 class CredentialPersist(Protocol):
@@ -78,9 +79,6 @@ class CredentialPersist(Protocol):
         cimd_client_id: str | None = None,
         refreshed_from: str | None = None,
     ) -> bool | None: ...
-
-
-CredentialRevoker: TypeAlias = Callable[[str, str, str, str | None], Awaitable[None]]
 
 
 def _parse_expires_in(raw: object) -> int | None:
@@ -232,10 +230,6 @@ class AuthorizationCodeRefresher:
             )
         )
 
-    async def _revoke_dead_grant(self, user_id: str, server_id: str, token: OAuthToken) -> None:
-        if self._revoke is not None:
-            await self._revoke(user_id, server_id, token.access_token, token.refresh_token)
-
     def _classified_denial(self, outcome: AuthorizationCodeTokenDenied) -> CredError:
         error: Final = outcome.body.get("error")
         if outcome.status_code >= 500 or outcome.status_code == 429 or error == "temporarily_unavailable":
@@ -245,3 +239,7 @@ class AuthorizationCodeRefresher:
         if isinstance(error, str) and error in {"invalid_grant", "invalid_token"}:
             return CredError.of_unauthorized("The upstream OAuth grant is no longer valid; sign in again.")
         return CredError.of_misconfigured(f"OAuth token endpoint rejected the refresh grant: {outcome.detail}")
+
+    async def _revoke_dead_grant(self, user_id: str, server_id: str, token: OAuthToken) -> None:
+        if self._revoke is not None:
+            await self._revoke(user_id, server_id, token.access_token, token.refresh_token)
