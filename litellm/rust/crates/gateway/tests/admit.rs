@@ -27,6 +27,9 @@ struct Scenario {
     /// The `tpm_limit` of each key that holds one.
     #[serde(default)]
     tpm_limits: BTreeMap<String, i64>,
+    /// The other rows the database holds, each under its table's name, stored in this order.
+    #[serde(default)]
+    rows: Vec<BTreeMap<String, serde_json::Value>>,
     /// What boot read of the config the proxy stores in its database.
     #[serde(default)]
     stored: Stored,
@@ -98,15 +101,19 @@ fn stored_config(stored: Stored, held: Held) -> StoredConfig {
 }
 
 /// The database holding each key of the scenario, a plain row with the model list and the token
-/// limit it gives.
+/// limit it gives, and each of its other rows.
 async fn listed(
     keys: &BTreeMap<String, Vec<String>>,
     tpm_limits: &BTreeMap<String, i64>,
+    rows: &[BTreeMap<String, serde_json::Value>],
 ) -> keys::Held {
     let held = keys::Held::start().await;
     for (token, models) in keys {
         let columns = serde_json::json!({"models": models, "tpm_limit": tpm_limits.get(token)});
         held.key(token, columns).await;
+    }
+    for (table, row) in rows.iter().flatten() {
+        held.insert(table, row).await;
     }
     held
 }
@@ -204,6 +211,7 @@ impl Sent {
     "request_timeout_beside_router_request_timeout"
 )]
 #[case::pre_call_checks("pre_call_checks")]
+#[case::end_user("end_user")]
 #[tokio::test(flavor = "multi_thread")]
 async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
     litellm_gateway::install_crypto_provider();
@@ -217,9 +225,9 @@ async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
     let state = litellm_gateway::AppState::over(&config, &Environment::default(), &resources)
         .await
         .unwrap();
-    let held = match scenario.keys.is_empty() {
+    let held = match scenario.keys.is_empty() && scenario.rows.is_empty() {
         true => None,
-        false => Some(listed(&scenario.keys, &scenario.tpm_limits).await),
+        false => Some(listed(&scenario.keys, &scenario.tpm_limits, &scenario.rows).await),
     };
     let state = match &held {
         None => state,
