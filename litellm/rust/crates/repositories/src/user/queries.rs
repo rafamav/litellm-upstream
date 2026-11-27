@@ -163,6 +163,24 @@ pub(super) async fn backfill_user_email(
     .await?)
 }
 
+/// [`backfill_user_email`], returning the row as stored, stamped in UTC when this call filled it
+pub(super) async fn backfill_user_email_returning(
+    executor: impl PgExecutor<'_>,
+    user_id: &str,
+    user_email: &str,
+    links_any_user: bool,
+) -> Result<Option<User>, Error> {
+    Ok(sqlx::query_file_as!(
+        User,
+        "src/user/queries/backfill_user_email_returning.sql",
+        user_id,
+        user_email,
+        links_any_user
+    )
+    .fetch_optional(executor)
+    .await?)
+}
+
 /// A user to create. `email_may_be_shared` stores the email even when another user holds it
 pub(super) struct NewUser<'a> {
     pub user_id: &'a str,
@@ -595,6 +613,111 @@ mod tests {
             super::backfill_user_email(&mut *tx, user_id, user_email, links_any_user).await?;
 
         assert_eq!(stored.as_deref(), expected);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::fills_a_missing_email(
+        "user-repository-null",
+        "new@example.com",
+        false,
+        Some("new@example.com")
+    )]
+    #[case::keeps_a_stored_email(
+        "user-repository-set",
+        "new@example.com",
+        false,
+        Some("set@example.com")
+    )]
+    #[case::refuses_an_email_another_user_holds(
+        "user-repository-null",
+        "Owner@example.com",
+        false,
+        None
+    )]
+    #[case::returns_nothing_for_a_stored_email_another_user_holds(
+        "user-repository-set",
+        "owner@example.com",
+        false,
+        None
+    )]
+    #[case::links_any_user_takes_a_held_email(
+        "user-repository-null",
+        "owner@example.com",
+        true,
+        Some("owner@example.com")
+    )]
+    #[case::missing_row("user-repository-missing", "new@example.com", false, None)]
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing to a Prisma-migrated PostgreSQL database"]
+    async fn email_backfill_returns_the_row_as_stored(
+        #[case] user_id: &str,
+        #[case] user_email: &str,
+        #[case] links_any_user: bool,
+        #[case] expected: Option<&str>,
+        #[future(awt)] database_pool: Result<PgPool, Box<dyn StdError>>,
+    ) -> Result<(), Box<dyn StdError>> {
+        let pool = database_pool?;
+        let mut tx = pool.begin().await?;
+        insert_user(&mut tx, "user-repository-null", None, None).await?;
+        insert_user(
+            &mut tx,
+            "user-repository-set",
+            Some("set@example.com"),
+            None,
+        )
+        .await?;
+        insert_user(
+            &mut tx,
+            "user-repository-owner",
+            Some("owner@example.com"),
+            None,
+        )
+        .await?;
+        insert_membership(&mut tx, "user-repository-null").await?;
+
+        let returned =
+            super::backfill_user_email_returning(&mut *tx, user_id, user_email, links_any_user)
+                .await?;
+        let stored = super::find_user(&mut *tx, Some(user_id), None).await?;
+
+        assert_eq!(
+            returned
+                .as_ref()
+                .and_then(|user| user.user_email.as_deref()),
+            expected
+        );
+        if returned.is_some() {
+            assert_eq!(returned, stored);
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing to a Prisma-migrated PostgreSQL database"]
+    async fn email_backfill_stamps_the_row_it_fills_in_utc(
+        #[future(awt)] database_pool: Result<PgPool, Box<dyn StdError>>,
+    ) -> Result<(), Box<dyn StdError>> {
+        let pool = database_pool?;
+        let mut tx = pool.begin().await?;
+        insert_user(&mut tx, "user-repository-null", None, None).await?;
+        leave_utc(&mut tx).await?;
+
+        super::backfill_user_email_returning(
+            &mut *tx,
+            "user-repository-null",
+            "new@example.com",
+            false,
+        )
+        .await?
+        .ok_or("no row came back")?;
+
+        let (_, updated_at_drift) = seconds_from_utc_now(&mut tx, "user-repository-null").await?;
+        assert!(
+            updated_at_drift < 1.0,
+            "updated_at is {updated_at_drift}s from UTC now"
+        );
         Ok(())
     }
 

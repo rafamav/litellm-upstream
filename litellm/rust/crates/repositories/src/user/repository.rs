@@ -193,6 +193,28 @@ impl UserRepository {
             .await
     }
 
+    /// [`Self::backfill_email`], returning the row as stored rather than its email, or `None` when another user
+    /// holds the email or the row is gone.
+    pub async fn backfill_email_returning(
+        &self,
+        user_id: &str,
+        user_email: &str,
+        links_any_user: bool,
+    ) -> Result<Option<User>, litellm_db::Error> {
+        self.database
+            .run(UPDATE_MANY_USERS, || async {
+                let mut session = self.database.session(Side::Writer).await?;
+                queries::backfill_user_email_returning(
+                    session.executor(),
+                    user_id,
+                    user_email,
+                    links_any_user,
+                )
+                .await
+            })
+            .await
+    }
+
     /// Sets the role of `user_id` and returns the row as stored, or `None` when no row has that id.
     pub async fn set_role(
         &self,

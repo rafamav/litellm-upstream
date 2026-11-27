@@ -1,0 +1,228 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH free AS (\n    SELECT $3::bool OR NOT EXISTS (\n        SELECT 1\n        FROM \"LiteLLM_UserTable\"\n        WHERE lower(user_email) = lower($2)\n          AND user_id <> $1\n    ) AS free\n), filled AS (\n    UPDATE \"LiteLLM_UserTable\"\n    SET user_email = $2,\n        updated_at = NOW() AT TIME ZONE 'UTC'\n    WHERE user_id = $1\n      AND user_email IS NULL\n      AND (SELECT free FROM free)\n    RETURNING *\n), stored AS (\n    SELECT *\n    FROM filled\n    UNION ALL\n    SELECT *\n    FROM \"LiteLLM_UserTable\"\n    WHERE user_id = $1\n      AND user_email IS NOT NULL\n      AND (SELECT free FROM free)\n)\nSELECT u.user_id AS \"user_id!\",\n       u.user_alias,\n       u.team_id,\n       u.sso_user_id,\n       u.organization_id,\n       u.object_permission_id,\n       u.password_reset_required,\n       u.last_breach_check_at,\n       COALESCE(u.teams, '{}') AS \"teams!\",\n       u.user_role,\n       u.max_budget,\n       u.rollover_max_budget,\n       u.rollover_credit,\n       u.budget_limits AS \"budget_limits: RawJson\",\n       u.spend AS \"spend!\",\n       u.user_email,\n       COALESCE(u.models, '{}') AS \"models!\",\n       u.metadata AS \"metadata!: RawJson\",\n       u.max_parallel_requests,\n       u.tpm_limit,\n       u.rpm_limit,\n       u.budget_duration,\n       u.budget_reset_at,\n       COALESCE(u.allowed_cache_controls, '{}') AS \"allowed_cache_controls!\",\n       COALESCE(u.policies, '{}') AS \"policies!\",\n       u.model_spend AS \"model_spend!: RawJson\",\n       u.model_max_budget AS \"model_max_budget!: RawJson\",\n       u.created_at,\n       u.updated_at,\n       COALESCE(\n           (SELECT jsonb_agg(to_jsonb(m) ORDER BY m.organization_id)\n            FROM \"LiteLLM_OrganizationMembership\" AS m\n            WHERE m.user_id = u.user_id),\n           '[]'\n       ) AS \"organization_memberships!: Json<Vec<OrganizationMembership>>\"\nFROM stored AS u\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_alias",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "team_id",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "sso_user_id",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "organization_id",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 5,
+        "name": "object_permission_id",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "password_reset_required",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 7,
+        "name": "last_breach_check_at",
+        "type_info": "Timestamp",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "teams!",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 9,
+        "name": "user_role",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 10,
+        "name": "max_budget",
+        "type_info": "Float8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 11,
+        "name": "rollover_max_budget",
+        "type_info": "Float8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 12,
+        "name": "rollover_credit",
+        "type_info": "Float8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 13,
+        "name": "budget_limits: RawJson",
+        "type_info": "Jsonb",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 14,
+        "name": "spend!",
+        "type_info": "Float8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 15,
+        "name": "user_email",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 16,
+        "name": "models!",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 17,
+        "name": "metadata!: RawJson",
+        "type_info": "Jsonb",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 18,
+        "name": "max_parallel_requests",
+        "type_info": "Int4",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 19,
+        "name": "tpm_limit",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 20,
+        "name": "rpm_limit",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 21,
+        "name": "budget_duration",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 22,
+        "name": "budget_reset_at",
+        "type_info": "Timestamp",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 23,
+        "name": "allowed_cache_controls!",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 24,
+        "name": "policies!",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 25,
+        "name": "model_spend!: RawJson",
+        "type_info": "Jsonb",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 26,
+        "name": "model_max_budget!: RawJson",
+        "type_info": "Jsonb",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 27,
+        "name": "created_at",
+        "type_info": "Timestamp",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 28,
+        "name": "updated_at",
+        "type_info": "Timestamp",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 29,
+        "name": "organization_memberships!: Json<Vec<OrganizationMembership>>",
+        "type_info": "Jsonb",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "4c4a2f64c2a34982774433b43074df6366dd7cf725b4510797ebd21fcd443df3"
+}
