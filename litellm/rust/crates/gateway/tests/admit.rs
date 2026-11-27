@@ -24,6 +24,9 @@ struct Scenario {
     /// The virtual keys the database holds, each token with the columns set on its row.
     #[serde(default)]
     keys: BTreeMap<String, Columns>,
+    /// The teams the database holds, each id with the columns set on its row.
+    #[serde(default)]
+    teams: BTreeMap<String, Columns>,
     /// What boot read of the config the proxy stores in its database.
     #[serde(default)]
     stored: Stored,
@@ -96,11 +99,19 @@ fn stored_config(stored: Stored, held: Held) -> StoredConfig {
 
 type Columns = serde_json::Map<String, serde_json::Value>;
 
-/// The database holding each key of the scenario, a plain row with its columns set on it.
-async fn listed(keys: &BTreeMap<String, Columns>) -> keys::Held {
+/// The database holding each key and each team of the scenario, a key as a plain row with its
+/// columns set on it.
+async fn listed(scenario: &Scenario) -> keys::Held {
     let held = keys::Held::start().await;
-    for (token, columns) in keys {
+    for (token, columns) in &scenario.keys {
         held.key(token, serde_json::Value::Object(columns.clone()))
+            .await;
+    }
+    for (team_id, columns) in &scenario.teams {
+        let row = std::iter::once(("team_id".to_owned(), serde_json::json!(team_id)))
+            .chain(columns.clone())
+            .collect();
+        held.insert_named("LiteLLM_TeamTable", &serde_json::Value::Object(row))
             .await;
     }
     held
@@ -199,6 +210,7 @@ impl Sent {
     "request_timeout_beside_router_request_timeout"
 )]
 #[case::pre_call_checks("pre_call_checks")]
+#[case::virtual_key_team("virtual_key_team")]
 #[tokio::test(flavor = "multi_thread")]
 async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
     litellm_gateway::install_crypto_provider();
@@ -206,15 +218,15 @@ async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
     let text = std::fs::read_to_string(&path).unwrap();
     let scenario: Scenario =
         serde_yaml_ng::from_value(litellm_yaml::from_str(&text).unwrap()).unwrap();
-    let config = Config::from_value(scenario.config).unwrap();
+    let config = Config::from_value(scenario.config.clone()).unwrap();
     let resources =
         litellm_gateway::Resources::over(&config, Arc::new(|_: &str| None::<String>)).unwrap();
     let state = litellm_gateway::AppState::over(&config, &Environment::default(), &resources)
         .await
         .unwrap();
-    let held = match scenario.keys.is_empty() {
+    let held = match scenario.keys.is_empty() && scenario.teams.is_empty() {
         true => None,
-        false => Some(listed(&scenario.keys).await),
+        false => Some(listed(&scenario).await),
     };
     let state = match &held {
         None => state,
