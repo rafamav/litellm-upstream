@@ -477,3 +477,36 @@ async def test_loser_rereads_the_fresh_token_a_successful_winner_persisted():
     token = await store.fetch("u", "s")
     assert token is not None and token.access_token == "winner-fresh"
     assert src.refresh_calls == 0
+
+
+async def test_peek_reads_the_current_token_without_consuming_a_refresh():
+    pair: Final = _RefreshablePair(OAuthToken(access_token="old", expires_at=900.0))
+    store: Final = RefreshingTokenStore(pair, pair, expiry_skew_seconds=30, clock=_Clock(1000.0))
+
+    token: Final = await store.peek("u", "s")
+
+    assert token is not None and token.access_token == "old"
+    assert pair.refresh_calls == 0
+
+
+async def test_refresh_now_refreshes_the_exact_rejected_token_once():
+    pair: Final = _RefreshablePair(OAuthToken(access_token="old", expires_at=9999.0))
+    store: Final = RefreshingTokenStore(pair, pair, expiry_skew_seconds=30, clock=_Clock(1000.0))
+
+    outcome: Final = await store.refresh_now("u", "s", "old")
+
+    assert isinstance(outcome, Ok)
+    assert outcome.ok.access_token == "refreshed"
+    assert pair.refresh_calls == 1
+
+
+async def test_refresh_now_uses_a_replacement_grant_without_a_second_refresh():
+    pair: Final = _RefreshablePair(OAuthToken(access_token="replacement", expires_at=9999.0))
+    refreshing: Final = RefreshingTokenStore(pair, pair, expiry_skew_seconds=30, clock=_Clock(1000.0))
+    store: Final = CachedOAuthTokenStore(refreshing, default_ttl_seconds=60, clock=_Clock(1000.0))
+
+    outcome: Final = await store.refresh_now("u", "s", "old")
+
+    assert isinstance(outcome, Ok)
+    assert outcome.ok.access_token == "replacement"
+    assert pair.refresh_calls == 0
