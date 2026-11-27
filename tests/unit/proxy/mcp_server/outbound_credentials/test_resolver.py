@@ -236,7 +236,7 @@ async def test_authorization_code_without_token_is_semantically_unauthorized():
 
 
 @pytest.mark.asyncio
-async def test_authorization_code_store_unavailable_is_unauthorized():
+async def test_authorization_code_store_unavailable_is_retryable_upstream_unavailable():
     class _Unavailable:
         async def fetch(self, user_id: str, server_id: str):
             raise TokenStoreUnavailable("down")
@@ -245,7 +245,7 @@ async def test_authorization_code_store_unavailable_is_unauthorized():
         Subject(tenant_id="", subject_id="alice"), _spec(AuthorizationCodeConfig())
     )
     assert isinstance(result, Error)
-    assert result.error.tag == "unauthorized"
+    assert result.error.tag == "upstream_unavailable"
 
 
 @pytest.mark.asyncio

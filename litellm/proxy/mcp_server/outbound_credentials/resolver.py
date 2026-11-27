@@ -40,6 +40,7 @@ from litellm.proxy.mcp_server.outbound_credentials.httpx_auth import (
 )
 from litellm.proxy.mcp_server.outbound_credentials.oauth_token_store import (
     OAuthToken,
+    OAuthTokenResolutionError,
     OAuthTokenStore,
     TokenStoreUnavailable,
 )
@@ -334,7 +335,12 @@ class UpstreamCredentialProvider:
     async def _authorization_code(
         self, subject: Subject, server: ServerSpec, config: AuthorizationCodeConfig
     ) -> Result[StaticHeaderAuth, CredError]:
-        token: Final = await self._authz_token(subject, server)
+        try:
+            token: Final = await self._oauth_token_store.fetch(subject.subject_id, server.server_id)
+        except OAuthTokenResolutionError as exc:
+            return Error(exc.error)
+        except TokenStoreUnavailable:
+            return Error(CredError.of_upstream_unavailable("OAuth token store is unavailable; retry the request."))
         if token is None:
             return Error(CredError.of_unauthorized("Authorization required: complete the OAuth flow for this server."))
         header_name, header_value = config.header(token.access_token)

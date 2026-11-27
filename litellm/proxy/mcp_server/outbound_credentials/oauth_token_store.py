@@ -5,11 +5,9 @@ The resolver reads a user's token through the injected ``OAuthTokenStore`` seam;
 signals an unreachable backing store, so an outage is never cached or read as "not authorized".
 
 ``RefreshingTokenStore`` mints a fresh token through an injected ``TokenRefresher`` when the stored
-one is near expiry, under in-process per-(user, server) single-flight so concurrent callers share
-one refresh. Distributed (cross-replica) single-flight and reactive-401 refresh are the later
-hardening. The mode plugs in its own source and refresher; the cache, store seam, and refresh
-machinery are shared across the oauth2 modes (authorization_code / client_credentials /
-token_exchange).
+one is near expiry, under per-(user, server) single-flight so concurrent callers share one refresh.
+The mode plugs in its own source and refresher; the cache, store seam, and refresh machinery are
+shared across the oauth2 modes (authorization_code / client_credentials / token_exchange).
 """
 
 from __future__ import annotations
@@ -19,6 +17,9 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Final, Generic, Protocol, TypeVar
+
+from litellm.proxy.mcp_server.outbound_credentials.result import Error, Ok, Result
+from litellm.proxy.mcp_server.outbound_credentials.types import CredError
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -47,6 +48,12 @@ class OAuthToken:
     def __repr__(self) -> str:
         has_refresh: Final = self.refresh_token is not None
         return f"OAuthToken(access_token=***, expires_at={self.expires_at!r}, has_refresh_token={has_refresh}, scopes={self.scopes!r})"
+
+
+class OAuthTokenResolutionError(Exception):
+    def __init__(self, error: CredError) -> None:
+        super().__init__(str(error))
+        self.error = error
 
 
 class TokenStoreUnavailable(Exception):
@@ -86,16 +93,15 @@ class TokenRefresher(Protocol):
     """Mints a fresh token from an expired one and persists it, returning the new token.
 
     The action is mode-specific: the ``authorization_code`` refresh_token grant, the
-    ``client_credentials`` grant, or an RFC 8693 re-exchange. Returns ``None`` when it cannot
-    refresh (e.g. no ``refresh_token``), which the caller turns into a 401 challenge. It must
-    persist the new token so later requests (and the surrounding cache) read it without refreshing.
+    ``client_credentials`` grant, or an RFC 8693 re-exchange. It must persist the new token so later
+    requests (and the surrounding cache) read it without refreshing.
 
     ``server_id`` selects the upstream's config (token endpoint, client credentials, scopes) the
     grant runs against; ``(user_id, server_id)`` is the key the new token is persisted under. They
     are not derivable from ``token``, so the seam threads them alongside it.
     """
 
-    async def refresh(self, user_id: str, server_id: str, token: OAuthToken) -> OAuthToken | None: ...
+    async def refresh(self, user_id: str, server_id: str, token: OAuthToken) -> Result[OAuthToken, CredError]: ...
 
 
 class TokenCacheBackend(Protocol):
@@ -255,8 +261,7 @@ class RefreshingTokenStore:
     bearer.
 
     The default coordinator is in-process; a cross-replica deployment injects a distributed one (Redis
-    SET NX). Reactive-401 refresh is later hardening (it lives in the egress transport, which sees the
-    upstream's 401). Composes under ``CachedOAuthTokenStore`` so the refreshed token is cached.
+    SET NX). Composes under ``CachedOAuthTokenStore`` so the refreshed token is cached.
     """
 
     def __init__(
@@ -265,14 +270,16 @@ class RefreshingTokenStore:
         refresher: TokenRefresher,
         *,
         expiry_skew_seconds: float = 60.0,
-        coordinator: RefreshCoordinator[OAuthToken | None] | None = None,
+        coordinator: RefreshCoordinator[Result[OAuthToken, CredError]] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._inner = inner
         self._refresher = refresher
         self._expiry_skew_seconds = expiry_skew_seconds
         self._clock = clock
-        self._coordinator: RefreshCoordinator[OAuthToken | None] = coordinator or InProcessRefreshCoordinator()
+        self._coordinator: RefreshCoordinator[Result[OAuthToken, CredError]] = (
+            coordinator or InProcessRefreshCoordinator()
+        )
 
     def _is_expired(self, token: OAuthToken) -> bool:
         return token.expires_at is not None and self._clock() >= token.expires_at - self._expiry_skew_seconds
@@ -282,25 +289,37 @@ class RefreshingTokenStore:
         if token is None or not self._is_expired(token):
             return token
 
-        async def refresh_latest_token() -> OAuthToken | None:
+        async def refresh_latest_token() -> Result[OAuthToken, CredError]:
             latest_token: Final = await self._inner.fetch(user_id, server_id)
-            if latest_token is None or not self._is_expired(latest_token):
-                return latest_token
-            refreshed: Final = await self._refresher.refresh(user_id, server_id, latest_token)
-            return refreshed if refreshed is not None else await reread_fresh_token()
+            if latest_token is None:
+                return Error(
+                    CredError.of_unauthorized("Authorization required: complete the OAuth flow for this server.")
+                )
+            if not self._is_expired(latest_token):
+                return Ok(latest_token)
+            match await self._refresher.refresh(user_id, server_id, latest_token):
+                case Ok(refreshed):
+                    return Ok(refreshed)
+                case Error(err):
+                    reread: Final = await self._reread_fresh_token(user_id, server_id)
+                    return reread if isinstance(reread, Ok) else Error(err)
 
-        async def reread_fresh_token() -> OAuthToken | None:
-            # A loser re-reads what the winner persisted. If the winner's refresh failed, the store
-            # still holds the expired token; surface None (-> challenge) like the winner did rather
-            # than the stale bearer the upstream would 401.
-            latest_token: Final = await self._inner.fetch(user_id, server_id)
-            if latest_token is None or self._is_expired(latest_token):
-                return None
-            return latest_token
-
-        return await self._coordinator.run(
+        outcome: Final = await self._coordinator.run(
             user_id,
             server_id,
             refresh=refresh_latest_token,
-            reread=reread_fresh_token,
+            reread=lambda: self._reread_fresh_token(user_id, server_id),
         )
+        if isinstance(outcome, Ok):
+            return outcome.ok
+        if outcome.error.tag == "unauthorized":
+            return None
+        raise OAuthTokenResolutionError(outcome.error)
+
+    async def _reread_fresh_token(self, user_id: str, server_id: str) -> Result[OAuthToken, CredError]:
+        latest_token: Final = await self._inner.fetch(user_id, server_id)
+        if latest_token is not None and not self._is_expired(latest_token):
+            return Ok(latest_token)
+        if latest_token is None or latest_token.refresh_token is None:
+            return Error(CredError.of_unauthorized("Authorization required: complete the OAuth flow for this server."))
+        return Error(CredError.of_upstream_unavailable("OAuth token refresh did not complete; retry the request."))

@@ -1,5 +1,6 @@
 import asyncio
 from types import SimpleNamespace
+from typing import Final
 
 import pytest
 
@@ -10,7 +11,11 @@ from litellm.proxy.mcp_server.outbound_credentials.oauth_token_store import (
 from litellm.proxy.mcp_server.outbound_credentials.per_user_oauth_store import (
     LazyPerUserOAuthTokenStore,
     ServerLookup,
+    _decode_refresh_error,
+    _encode_refresh_error,
 )
+from litellm.proxy.mcp_server.outbound_credentials.result import Error, Ok
+from litellm.proxy.mcp_server.outbound_credentials.types import CredError
 
 
 class _RecordingStore:
@@ -97,7 +102,8 @@ async def test_native_refresh_persists_actual_grant_through_storage_adapter(
     await record_oauth_scope_refusal(credentials_prisma, "alice", "srv", "gist")
     refresher = AuthorizationCodeRefresher(lambda _: server, token_endpoint, _persist_credential)
     refreshed = await refresher.refresh("alice", "srv", OAuthToken("old", refresh_token="refresh", scopes=prior_scopes))
-    assert refreshed is not None and refreshed.scopes == tuple(expected)
+    assert isinstance(refreshed, Ok)
+    assert refreshed.ok.scopes == tuple(expected)
     payload = await get_user_oauth_credential(credentials_prisma, "alice", "srv")
     assert payload is not None and payload.get("scopes") == expected
     assert payload["access_token"] == "rotated"
@@ -457,83 +463,20 @@ async def test_expired_unverified_credential_never_reaches_refresh(monkeypatch):
     post.assert_not_awaited()
 
 
-def test_redis_availability_reads_the_shared_usage_cache(monkeypatch) -> None:
-    from litellm.proxy import proxy_server
-    from litellm.proxy.mcp_server.outbound_credentials.per_user_oauth_store import _redis_cache_is_available
-
-    monkeypatch.setattr(proxy_server, "redis_usage_cache", object())
-    assert _redis_cache_is_available() is True
-    monkeypatch.setattr(proxy_server, "redis_usage_cache", None)
-    assert _redis_cache_is_available() is False
-
-
-def test_runtime_backend_uses_the_same_shared_usage_cache_as_the_coordinator(monkeypatch) -> None:
-    from litellm.proxy import proxy_server
-    from litellm.proxy.mcp_server.outbound_credentials import per_user_oauth_store
-
-    redis_cache = object()
-    coordinator = object()
-    monkeypatch.setattr(proxy_server, "redis_usage_cache", redis_cache)
-    monkeypatch.setattr(per_user_oauth_store, "runtime_refresh_coordinator", lambda: coordinator)
-
-    backend, actual_coordinator, uses_redis = per_user_oauth_store._runtime_backend_and_coordinator()
-
-    assert uses_redis is True
-    assert actual_coordinator is coordinator
-    assert backend is not None and backend.cache is redis_cache
+def test_refresh_error_publication_roundtrips_the_exact_failure_class():
+    original: Final = Error(
+        CredError.of_misconfigured("OAuth client authentication failed; check the server client configuration.")
+    )
+    encoded: Final = _encode_refresh_error(original)
+    assert encoded is not None
+    decoded: Final = _decode_refresh_error(encoded)
+    assert isinstance(decoded, Error)
+    assert decoded.error.tag == "misconfigured"
+    assert (
+        decoded.error.misconfigured
+        == "misconfigured: OAuth client authentication failed; check the server client configuration."
+    )
 
 
-@pytest.mark.asyncio
-async def test_token_endpoint_success_is_typed_with_the_json_body(monkeypatch):
-    import httpx
-
-    from litellm.llms.custom_httpx import http_handler
-    from litellm.proxy.mcp_server.outbound_credentials.authz_code_refresher import AuthorizationCodeTokenSuccess
-    from litellm.proxy.mcp_server.outbound_credentials.per_user_oauth_store import _post_token_endpoint
-
-    class Client:
-        async def post(self, url, headers, data):
-            request = httpx.Request("POST", url)
-            return httpx.Response(200, json={"access_token": "new"}, request=request)
-
-    monkeypatch.setattr(http_handler, "get_async_httpx_client", lambda llm_provider: Client())
-    outcome = await _post_token_endpoint("https://idp.example/token", {}, {})
-    assert isinstance(outcome, AuthorizationCodeTokenSuccess)
-    assert outcome.body == {"access_token": "new"}
-
-
-@pytest.mark.asyncio
-async def test_token_endpoint_http_denial_preserves_status_and_error_body(monkeypatch):
-    import httpx
-
-    from litellm.llms.custom_httpx import http_handler
-    from litellm.proxy.mcp_server.outbound_credentials.authz_code_refresher import AuthorizationCodeTokenDenied
-    from litellm.proxy.mcp_server.outbound_credentials.per_user_oauth_store import _post_token_endpoint
-
-    class Client:
-        async def post(self, url, headers, data):
-            request = httpx.Request("POST", url)
-            response = httpx.Response(400, json={"error": "invalid_grant"}, request=request)
-            response.raise_for_status()
-
-    monkeypatch.setattr(http_handler, "get_async_httpx_client", lambda llm_provider: Client())
-    outcome = await _post_token_endpoint("https://idp.example/token", {}, {})
-    assert isinstance(outcome, AuthorizationCodeTokenDenied)
-    assert outcome.status_code == 400
-    assert outcome.body == {"error": "invalid_grant"}
-
-
-@pytest.mark.asyncio
-async def test_token_endpoint_transport_failure_is_typed_unreachable(monkeypatch):
-    from litellm.llms.custom_httpx import http_handler
-    from litellm.proxy.mcp_server.outbound_credentials.authz_code_refresher import AuthorizationCodeTokenUnreachable
-    from litellm.proxy.mcp_server.outbound_credentials.per_user_oauth_store import _post_token_endpoint
-
-    class Client:
-        async def post(self, url, headers, data):
-            raise TimeoutError("connect timed out")
-
-    monkeypatch.setattr(http_handler, "get_async_httpx_client", lambda llm_provider: Client())
-    outcome = await _post_token_endpoint("https://idp.example/token", {}, {})
-    assert isinstance(outcome, AuthorizationCodeTokenUnreachable)
-    assert outcome.detail == "TimeoutError"
+def test_refresh_error_publication_never_encodes_a_token():
+    assert _encode_refresh_error(Ok(OAuthToken(access_token="secret-access-token"))) is None

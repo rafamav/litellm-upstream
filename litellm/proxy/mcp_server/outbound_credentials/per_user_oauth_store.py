@@ -14,7 +14,7 @@ import asyncio
 import json
 from collections.abc import Callable, Mapping
 from functools import partial
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 
 import httpx
 from pydantic import TypeAdapter, ValidationError
@@ -39,12 +39,14 @@ from litellm.proxy.mcp_server.outbound_credentials.oauth_token_store import (
     TokenCacheBackend,
     TokenStoreUnavailable,
 )
+from litellm.proxy.mcp_server.outbound_credentials.result import Error, Result
 from litellm.proxy.mcp_server.outbound_credentials.runtime_refresh_coordinator import (
     runtime_refresh_coordinator,
 )
 from litellm.proxy.mcp_server.outbound_credentials.token_cache_codec import (
     OAuthTokenCacheCodec,
 )
+from litellm.proxy.mcp_server.outbound_credentials.types import CredError
 from litellm.proxy.mcp_server.outbound_credentials.v2_token_store import (
     V2PerUserTokenStore,
 )
@@ -141,13 +143,48 @@ async def _post_token_endpoint(
 
 
 def _redis_cache_is_available() -> bool:
-    from litellm.proxy.proxy_server import redis_usage_cache  # noqa: PLC0415
+    from litellm.proxy.proxy_server import (
+        redis_usage_cache,  # noqa: PLC0415
+    )
 
     return redis_usage_cache is not None
 
 
+def _encode_refresh_error(outcome: Result[OAuthToken, CredError]) -> str | None:
+    if not isinstance(outcome, Error):
+        return None
+    return json.dumps({"tag": outcome.error.tag, "detail": outcome.error.summary})
+
+
+def _decode_refresh_error(payload: str) -> Result[OAuthToken, CredError] | None:
+    try:
+        raw: Final = cast(object, json.loads(payload))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    payload_map: Final = cast(Mapping[object, object], raw)
+    tag: Final = payload_map.get("tag")
+    detail: Final = payload_map.get("detail")
+    if not isinstance(tag, str) or not isinstance(detail, str):
+        return None
+    match tag:
+        case "unauthorized":
+            return Error(CredError.of_unauthorized(detail))
+        case "misconfigured":
+            return Error(CredError.of_misconfigured(detail))
+        case "precondition_required":
+            return Error(CredError.of_precondition_required(detail))
+        case _:
+            return Error(CredError.of_upstream_unavailable(detail))
+
+
+def _runtime_result_coordinator() -> RefreshCoordinator[Result[OAuthToken, CredError]] | None:
+    return runtime_refresh_coordinator(encode_error=_encode_refresh_error, decode_error=_decode_refresh_error)
+
+
 def _runtime_backend_and_coordinator() -> tuple[
-    TokenCacheBackend | None, RefreshCoordinator[OAuthToken | None] | None, bool
+    TokenCacheBackend | None, RefreshCoordinator[Result[OAuthToken, CredError]] | None, bool
 ]:
     """The cross-replica cache + coordinator when Redis is wired, else ``(None, None, False)`` so the
     foundation's in-process defaults are used (a single replica needs no shared cache or lock).
@@ -156,9 +193,11 @@ def _runtime_backend_and_coordinator() -> tuple[
         decrypt_value_helper,
         encrypt_value_helper,
     )
-    from litellm.proxy.proxy_server import redis_usage_cache  # noqa: PLC0415
+    from litellm.proxy.proxy_server import (
+        redis_usage_cache,  # noqa: PLC0415
+    )
 
-    coordinator: Final = runtime_refresh_coordinator()
+    coordinator: Final = _runtime_result_coordinator()
     if coordinator is None or redis_usage_cache is None:
         return None, None, False
     codec: Final = OAuthTokenCacheCodec(
@@ -246,7 +285,7 @@ class LazyPerUserOAuthTokenStore:
             return await asyncio.shield(operation)
         finally:
             if not uses_redis:
-                self._finish_local_operation(operation)
+                self._finish_local_operation(cast(asyncio.Future[object], operation))
 
     async def invalidate(self, user_id: str, server_id: str) -> None:
         """Drop the chain's cached entry for ``(user_id, server_id)`` after the credential row

@@ -30,6 +30,8 @@ from litellm.proxy.mcp_server.oauth_utils import build_upstream_oauth2_token_req
 from litellm.proxy.mcp_server.outbound_credentials.oauth_token_store import (
     OAuthToken,
 )
+from litellm.proxy.mcp_server.outbound_credentials.result import Error, Ok, Result
+from litellm.proxy.mcp_server.outbound_credentials.types import CredError
 
 if TYPE_CHECKING:
     from litellm.types.mcp_server.mcp_server_manager import MCPServer
@@ -122,23 +124,25 @@ class AuthorizationCodeRefresher:
         self._clock = clock
         self._identity_validator = identity_validator
 
-    async def refresh(self, user_id: str, server_id: str, token: OAuthToken) -> OAuthToken | None:
+    async def refresh(self, user_id: str, server_id: str, token: OAuthToken) -> Result[OAuthToken, CredError]:
         try:
             return await self._refresh(user_id, server_id, token)
         except HTTPException as exc:
             if exc.status_code != 403:
                 raise
-            return None
+            return Error(
+                CredError.of_precondition_required("The upstream OAuth identity does not match this LiteLLM user.")
+            )
 
-    async def _refresh(self, user_id: str, server_id: str, token: OAuthToken) -> OAuthToken | None:
+    async def _refresh(self, user_id: str, server_id: str, token: OAuthToken) -> Result[OAuthToken, CredError]:
         if token.refresh_token is None:
-            return None
+            return Error(CredError.of_unauthorized("Authorization required: complete the OAuth flow for this server."))
         server: Final = self._server_lookup(server_id)
         if server is None:
-            return None
+            return Error(CredError.of_misconfigured("OAuth server configuration is missing"))
         token_url: Final = server.effective_token_url
         if not token_url:
-            return None
+            return Error(CredError.of_misconfigured("OAuth server configuration is missing a token endpoint"))
 
         cimd_client_id: Final = token.cimd_client_id or get_cimd_client_id(server)
         try:
@@ -151,7 +155,7 @@ class AuthorizationCodeRefresher:
             )
         except TokenEndpointAuthConfigError as exc:
             verbose_logger.warning("MCP OAuth refresh misconfigured for server %s: %s", server_id, exc)
-            return None
+            return Error(CredError.of_misconfigured("OAuth token endpoint client authentication is misconfigured"))
         binding: Final = server.oauth_identity_binding
         if binding is not None and binding.mode == "enforce":
             await self._identity_validator(
@@ -169,14 +173,17 @@ class AuthorizationCodeRefresher:
         outcome: Final = await self._token_endpoint(token_url, form, token_request.headers)
         match outcome:
             case AuthorizationCodeTokenUnreachable():
-                return None
+                return Error(
+                    CredError.of_upstream_unavailable("OAuth token endpoint is unreachable; retry the request.")
+                )
             case AuthorizationCodeTokenDenied():
-                return None
+                failure: Final = self._classified_denial(outcome)
+                return Error(failure)
             case AuthorizationCodeTokenSuccess():
                 body: Final = outcome.body or {}
         access_token: Final = body.get("access_token")
         if not isinstance(access_token, str) or not access_token:
-            return None
+            return Error(CredError.of_upstream_unavailable("OAuth token endpoint response is missing an access token."))
 
         binding_proof: Final = await self._identity_validator(
             server=server,
@@ -202,13 +209,27 @@ class AuthorizationCodeRefresher:
             **({"cimd_client_id": cimd_client_id} if cimd_client_id is not None else {}),
             refreshed_from=token.refresh_token,
         )
-        if stored is False:
-            return None
-        return OAuthToken(
-            access_token=access_token,
-            expires_at=self._clock() + expires_in if expires_in is not None else None,
-            refresh_token=new_refresh,
-            scopes=scopes,
-            identity_binding_proof=binding_proof,
-            cimd_client_id=cimd_client_id,
+        if stored is not True:
+            return Error(
+                CredError.of_upstream_unavailable("OAuth token refresh could not be persisted; retry the request.")
+            )
+        return Ok(
+            OAuthToken(
+                access_token=access_token,
+                expires_at=self._clock() + expires_in if expires_in is not None else None,
+                refresh_token=new_refresh,
+                scopes=scopes,
+                identity_binding_proof=binding_proof,
+                cimd_client_id=cimd_client_id,
+            )
         )
+
+    def _classified_denial(self, outcome: AuthorizationCodeTokenDenied) -> CredError:
+        error: Final = outcome.body.get("error")
+        if outcome.status_code >= 500 or outcome.status_code == 429 or error == "temporarily_unavailable":
+            return CredError.of_upstream_unavailable(
+                "OAuth token endpoint is temporarily unavailable; retry the request."
+            )
+        if isinstance(error, str) and error in {"invalid_grant", "invalid_token"}:
+            return CredError.of_unauthorized("The upstream OAuth grant is no longer valid; sign in again.")
+        return CredError.of_misconfigured(f"OAuth token endpoint rejected the refresh grant: {outcome.detail}")
