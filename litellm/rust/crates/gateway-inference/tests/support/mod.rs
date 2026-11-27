@@ -17,10 +17,10 @@ use litellm_gateway::{
 };
 use litellm_gateway_auth::Authenticated;
 use litellm_gateway_auth_core::Caller;
+use litellm_gateway_inference::messages::Configured;
 use litellm_gateway_inference::{RouterTiers, RoutingCache, router};
 use litellm_http::{HttpClientPool, HttpSettings, Resolution, media::PublicDnsResolver};
 use litellm_inference::resources::CoreResources;
-use litellm_inference_messages::MessagesSettings;
 use litellm_model_catalog::{CostMap, IntegrityLimits};
 use litellm_secret_value::SecretValue;
 use litellm_secrets::source::SecretSource;
@@ -113,7 +113,7 @@ pub fn app_with_router_settings(
                 .chain(litellm_params.as_object().cloned().unwrap_or_default())
                 .collect(),
         ),
-        MessagesSettings::default(),
+        Configured::default(),
         None,
         NativeHost::default(),
         &serde_json::from_value(router_settings).unwrap(),
@@ -128,7 +128,7 @@ pub fn app_with_callbacks(
 ) -> Router {
     mounted(Arc::new(hosted_gateway(
         public_model(test_params(model, api_base)),
-        MessagesSettings::default(),
+        Configured::default(),
         None,
         NativeHost::new(
             Arc::new(Callbacks::new(callbacks.into_iter().map(Into::into).collect()).unwrap()),
@@ -152,7 +152,7 @@ fn configured_app(
 ) -> Router {
     mounted(Arc::new(hosted_gateway(
         public_model(test_params(model, api_base)),
-        MessagesSettings::default(),
+        Configured::default(),
         cache,
         NativeHost::default(),
         &RouterSettings::default(),
@@ -165,7 +165,7 @@ fn mounted(gateway: Arc<Gateway>) -> Router {
 
 fn hosted_gateway(
     model_list: Vec<DeploymentSpec>,
-    settings: MessagesSettings,
+    settings: Configured,
     cache: Option<Arc<dyn litellm_cache_response::ResponseCacheService>>,
     host: NativeHost,
     router_settings: &RouterSettings,
@@ -213,7 +213,7 @@ fn public_model(litellm_params: Map<String, Value>) -> Vec<DeploymentSpec> {
 pub fn app_with_models(model_list: Value, router_settings: Value) -> Router {
     mounted(Arc::new(hosted_gateway(
         serde_json::from_value(model_list).unwrap(),
-        MessagesSettings::default(),
+        Configured::default(),
         None,
         NativeHost::default(),
         &serde_json::from_value(router_settings).unwrap(),
@@ -233,14 +233,19 @@ async fn as_the_master_key(
 }
 
 pub async fn post(app: Router, path: &str, body: Value) -> Response {
-    app.oneshot(
-        Request::post(path)
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap(),
-    )
-    .await
-    .unwrap()
+    post_from(app, path, None, body).await
+}
+
+/// `post` from the client that names itself `user_agent`.
+pub async fn post_from(app: Router, path: &str, user_agent: Option<&str>, body: Value) -> Response {
+    let request = Request::post(path).header("content-type", "application/json");
+    let request = match user_agent {
+        Some(user_agent) => request.header("user-agent", user_agent),
+        None => request,
+    };
+    app.oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap()
 }
 
 pub async fn json(response: Response) -> Value {
