@@ -1,4 +1,5 @@
-//! `LiteLLM_TeamTable` reads for auth, by id or by alias, with each team's `LiteLLM_ModelTable` aliases nested in by the SQL.
+//! `LiteLLM_TeamTable` reads for auth, by id or by alias, with each team's `LiteLLM_ModelTable` aliases nested in by the SQL,
+//! and the statements of a team insert.
 
 use chrono::NaiveDateTime;
 use serde::Serialize;
@@ -6,7 +7,9 @@ use sqlx::PgExecutor;
 
 use litellm_db::Error;
 
+use super::repository::NewTeam;
 use crate::RawJson;
+use crate::utc_timestamp::naive_utc;
 
 /// One `LiteLLM_TeamTable` row as auth reads it, with its JSON columns kept opaque for the host's codec.
 #[macro_rules_attribute::apply(crate::db_row)]
@@ -71,6 +74,113 @@ pub(super) async fn find_teams_by_alias(
             .fetch_all(executor)
             .await?,
     )
+}
+
+/// Inserts `team`, or nothing when its id is already taken; the id when this call stored it.
+pub(super) async fn insert_team(
+    executor: impl PgExecutor<'_>,
+    team: &NewTeam,
+) -> Result<Option<String>, Error> {
+    Ok(sqlx::query_file_scalar!(
+        "src/team/queries/insert_team.sql",
+        team.team_id,
+        team.organization_id.as_deref(),
+        team.max_budget,
+        team.budget_duration.as_deref(),
+        team.budget_reset_at.and_then(naive_utc),
+        team.tpm_limit,
+        team.rpm_limit,
+        team.team_member_permissions.as_deref(),
+        team.access_group_ids.as_deref()
+    )
+    .fetch_optional(executor)
+    .await?)
+}
+
+/// Takes the advisory lock the management endpoints hold while they write `team_id`, until the transaction ends.
+pub(super) async fn lock_team(executor: impl PgExecutor<'_>, team_id: &str) -> Result<(), Error> {
+    sqlx::query_file_scalar!("src/team/queries/lock_team.sql", team_id)
+        .fetch_one(executor)
+        .await?;
+    Ok(())
+}
+
+/// The access groups `team_id` names, with its row locked, or `None` when the team is gone.
+pub(super) async fn lock_team_access_group_ids(
+    executor: impl PgExecutor<'_>,
+    team_id: &str,
+) -> Result<Option<Vec<String>>, Error> {
+    Ok(
+        sqlx::query_file_scalar!("src/team/queries/lock_team_access_group_ids.sql", team_id)
+            .fetch_optional(executor)
+            .await?,
+    )
+}
+
+/// An access group on either side of a reconcile, and whether it lists the team now.
+#[macro_rules_attribute::apply(crate::db_row)]
+pub(super) struct TeamAccessGroup {
+    pub access_group_id: String,
+    pub attached: bool,
+}
+
+/// The access groups `access_group_ids` names or that list `team_id`.
+pub(super) async fn access_groups_of_team(
+    executor: impl PgExecutor<'_>,
+    team_id: &str,
+    access_group_ids: &[String],
+) -> Result<Vec<TeamAccessGroup>, Error> {
+    Ok(sqlx::query_file_as!(
+        TeamAccessGroup,
+        "src/team/queries/access_groups_of_team.sql",
+        team_id,
+        access_group_ids
+    )
+    .fetch_all(executor)
+    .await?)
+}
+
+/// Locks the rows of `access_group_ids` in id order.
+pub(super) async fn lock_access_groups(
+    executor: impl PgExecutor<'_>,
+    access_group_ids: &[String],
+) -> Result<(), Error> {
+    sqlx::query_file_scalar!("src/team/queries/lock_access_groups.sql", access_group_ids)
+        .fetch_all(executor)
+        .await?;
+    Ok(())
+}
+
+/// Adds `team_id` to the teams of each access group in `access_group_ids` that does not list it.
+pub(super) async fn attach_team_to_access_groups(
+    executor: impl PgExecutor<'_>,
+    team_id: &str,
+    access_group_ids: &[String],
+) -> Result<(), Error> {
+    sqlx::query_file!(
+        "src/team/queries/attach_team_to_access_groups.sql",
+        team_id,
+        access_group_ids
+    )
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Takes `team_id` off the teams of each access group in `access_group_ids`.
+pub(super) async fn detach_team_from_access_groups(
+    executor: impl PgExecutor<'_>,
+    team_id: &str,
+    access_group_ids: &[String],
+) -> Result<(), Error> {
+    sqlx::query_file!(
+        "src/team/queries/detach_team_from_access_groups.sql",
+        team_id,
+        access_group_ids
+    )
+    .execute(executor)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
