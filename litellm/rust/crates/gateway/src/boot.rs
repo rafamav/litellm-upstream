@@ -58,7 +58,7 @@ pub(crate) fn request_timeout(settings: &LiteLlmSettings) -> Option<f64> {
 /// What `litellm_settings` sets for a messages call to any deployment.
 pub(crate) fn configured(settings: &LiteLlmSettings) -> MessagesSettings {
     MessagesSettings {
-        global_drop_params: settings.drop_params == Some(true),
+        drop_params: settings.drop_params == Some(true),
         reasoning_auto_summary: settings.reasoning_auto_summary,
         request_timeout: request_timeout(settings),
         ..MessagesSettings::default()
@@ -135,7 +135,7 @@ mod tests {
 
         assert_eq!(
             (
-                settings.global_drop_params,
+                settings.drop_params,
                 settings.reasoning_auto_summary,
                 settings.request_timeout,
             ),

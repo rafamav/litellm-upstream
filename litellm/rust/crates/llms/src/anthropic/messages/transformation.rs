@@ -201,7 +201,7 @@ impl MessagesDialect for AnthropicMessagesConfig {
         let stripped = strip_beta_gated_request(
             request,
             &existing_betas(&headers),
-            context.drops_unsupported_params,
+            context.drop_params,
             BetaProvider::Anthropic,
         );
         Ok((stripped, headers))
@@ -287,7 +287,7 @@ pub fn should_retry_anthropic_messages_on_http_error(
     {
         return true;
     }
-    let drops_rejected_strict_tools = context.drops_unsupported_params
+    let drops_rejected_strict_tools = context.drop_params
         && is_claude_strict_tools_rejection(status, error_text)
         && tools_without_strict(request_body.get("tools")).is_some();
     if drops_rejected_strict_tools {
@@ -410,7 +410,7 @@ pub(crate) fn transform_messages_request(
         .context_management
         .clone()
         .map(map_openai_context_management_to_anthropic);
-    let request = if context.drops_unsupported_params {
+    let request = if context.drop_params {
         MessagesRequest {
             params: MessagesOptionalParams {
                 system: request.params.system.and_then(drop_non_string_system_texts),
@@ -421,7 +421,7 @@ pub(crate) fn transform_messages_request(
     } else {
         request
     };
-    let messages = if context.drops_unsupported_params {
+    let messages = if context.drop_params {
         map_messages_rejecting_emptied(
             request.messages,
             drop_non_string_user_texts,
@@ -434,7 +434,7 @@ pub(crate) fn transform_messages_request(
         || continues_message_thread(&request.params)
     {
         messages
-    } else if context.drops_unsupported_params {
+    } else if context.drop_params {
         map_messages(messages, drop_advisor_blocks, drop_raw_advisor_blocks)
     } else {
         map_messages(messages, strip_advisor_blocks, strip_raw_advisor_blocks)
@@ -469,7 +469,7 @@ fn without_unstructured_output_format(
     request: MessagesRequest,
     context: &MessagesTransformContext,
 ) -> MessagesRequest {
-    if !context.drops_unsupported_params
+    if !context.drop_params
         || request
             .params
             .output_format
@@ -975,17 +975,11 @@ mod tests {
         MessagesModelCapabilities::default()
     }
 
-    fn transformed_messages(
-        messages: Value,
-        drops_unsupported_params: bool,
-    ) -> Result<Value, Error> {
+    fn transformed_messages(messages: Value, drop_params: bool) -> Result<Value, Error> {
         ANTHROPIC_MESSAGES_CONFIG
             .transform_anthropic_messages_request(
                 request(json!({"messages": messages})),
-                &MessagesTransformContext {
-                    drops_unsupported_params,
-                    ..MessagesTransformContext::with_lookup(unmapped(), false, &no_env)
-                },
+                &MessagesTransformContext::with_lookup(unmapped(), drop_params, &no_env),
             )
             .map(|transformed| serde_json::to_value(transformed).unwrap()["messages"].clone())
     }
@@ -1502,13 +1496,10 @@ mod tests {
     #[case::object_kept(json!({"type": "json_schema"}), true, Some(json!({"type": "json_schema"})))]
     fn a_non_object_output_format_is_dropped_under_drop_params(
         #[case] output_format: Value,
-        #[case] drops_unsupported_params: bool,
+        #[case] drop_params: bool,
         #[case] expected: Option<Value>,
     ) {
-        let context = MessagesTransformContext {
-            drops_unsupported_params,
-            ..MessagesTransformContext::with_lookup(unmapped(), false, &no_env)
-        };
+        let context = MessagesTransformContext::with_lookup(unmapped(), drop_params, &no_env);
         let transformed = ANTHROPIC_MESSAGES_CONFIG
             .transform_anthropic_messages_request(
                 request(json!({"output_format": output_format})),
@@ -1651,14 +1642,11 @@ mod tests {
     )]
     fn advisor_history_left_unpaired_is_dropped_only_under_drop_params(
         #[case] unpaired: Value,
-        #[case] drops_unsupported_params: bool,
+        #[case] drop_params: bool,
         #[case] kept: Value,
         unmapped: MessagesModelCapabilities,
     ) {
-        let context = MessagesTransformContext {
-            drops_unsupported_params,
-            ..MessagesTransformContext::with_lookup(unmapped, false, &no_env)
-        };
+        let context = MessagesTransformContext::with_lookup(unmapped, drop_params, &no_env);
         let content = [
             vec![json!({"type": "server_tool_use", "id": "srvtoolu_1", "name": "advisor", "input": {}})],
             unpaired.as_array().unwrap().clone(),
@@ -1849,8 +1837,6 @@ mod tests {
                         warns_dropped_disabled_thinking: false,
                     },
                     drop_params: true,
-                    drops_unsupported_params: false,
-                    global_drop_params: false,
                     claude_base_model: false,
                     keeps_unsigned_thinking: false,
                 }
@@ -2592,7 +2578,7 @@ mod tests {
                 let status = u16::try_from(case["status"].as_u64().unwrap()).unwrap();
                 let error_text = case["error_text"].as_str().unwrap();
                 let context = MessagesTransformContext {
-                    drops_unsupported_params: case["drops_unsupported_params"].as_bool().unwrap(),
+                    drop_params: case["drop_params"].as_bool().unwrap(),
                     ..MessagesTransformContext::default()
                 };
                 let mut reasons = Vec::new();

@@ -78,6 +78,8 @@ pub struct VertexShaping {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MessagesSettings {
+    /// Whether the call drops what its provider rejects. The host decides it once, from
+    /// `litellm_settings.drop_params` and the deployment's and the request's own `drop_params`.
     #[serde(default)]
     pub drop_params: bool,
     #[serde(default)]
@@ -94,10 +96,6 @@ pub struct MessagesSettings {
     pub joined_reads: bool,
     #[serde(default)]
     pub presanitized: bool,
-    #[serde(default)]
-    pub drops_unsupported_params: bool,
-    #[serde(default)]
-    pub global_drop_params: bool,
     #[serde(default)]
     pub intercepted: bool,
     #[serde(default)]
@@ -137,7 +135,7 @@ impl MessagesSettings {
         MessagesShapeOptions {
             reasoning_auto_summary: self.reasoning_auto_summary,
             presanitized: self.presanitized,
-            drops_unsupported_params: self.drops_unsupported_params,
+            drops_unsupported_params: self.drop_params,
         }
     }
 
@@ -216,8 +214,7 @@ mod tests {
             "drop_params": true,
             "reasoning_auto_summary": true,
             "additional_drop_params": ["metadata.user_id", "thinking"],
-            "request_timeout": 1800.0,
-            "drops_unsupported_params": true
+            "request_timeout": 1800.0
         }),
         MessagesShaping {
             vertex: VertexShaping::default(),
@@ -226,7 +223,6 @@ mod tests {
                 reasoning_auto_summary: true,
                 additional_drop_params: vec!["metadata.user_id".to_string(), "thinking".to_string()],
                 request_timeout: Some(1800.0),
-                drops_unsupported_params: true,
                 ..MessagesSettings::default()
             },
             capabilities: MessagesModelCapabilities {
@@ -265,10 +261,6 @@ mod tests {
         assert_eq!(
             serialized["reasoning_auto_summary"],
             json!(expected.settings.reasoning_auto_summary)
-        );
-        assert_eq!(
-            serialized["drops_unsupported_params"],
-            json!(expected.settings.drops_unsupported_params)
         );
         assert_eq!(
             serialized["additional_drop_params"],

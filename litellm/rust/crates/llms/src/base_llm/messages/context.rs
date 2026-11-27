@@ -175,7 +175,7 @@ impl ThinkingBudgets {
 pub struct ThinkingContext {
     pub capabilities: MessagesModelCapabilities,
     pub budgets: ThinkingBudgets,
-    /// `drop_params` as Python's thinking translation reads it.
+    /// The context's `drop_params`, for the thinking translation that is handed only this.
     pub drop_params: bool,
     /// The provider accepts `display: "updates"` on thinking translated from the legacy shape
     /// (Python's `LEGACY_THINKING_DISPLAY_UPDATES_PROVIDERS`).
@@ -187,9 +187,9 @@ pub struct ThinkingContext {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MessagesTransformContext {
     pub thinking: ThinkingContext,
+    /// Whether the call drops what its provider rejects, which a host decides once from
+    /// `litellm_settings.drop_params` and the deployment's and the request's own `drop_params`.
     pub drop_params: bool,
-    pub drops_unsupported_params: bool,
-    pub global_drop_params: bool,
     pub claude_base_model: bool,
     pub keeps_unsigned_thinking: bool,
 }
@@ -212,8 +212,6 @@ impl MessagesTransformContext {
                 warns_dropped_disabled_thinking: false,
             },
             drop_params,
-            drops_unsupported_params: false,
-            global_drop_params: false,
             claude_base_model: false,
             keeps_unsigned_thinking: false,
         }
