@@ -242,6 +242,46 @@ async def test_lazy_store_waits_for_in_flight_local_fetch_before_redis_rebuild()
 
 
 @pytest.mark.asyncio
+async def test_cancelled_local_fetch_still_blocks_the_redis_rebuild_until_it_finishes() -> None:
+    local_store = _BlockingStore("local")
+    redis_store = _RecordingStore("redis")
+    redis_available = _RedisAvailability()
+
+    def build_store(_server_lookup: ServerLookup) -> tuple[InvalidatableOAuthTokenStore, bool]:
+        if redis_available.available:
+            return redis_store, True
+        return local_store, False
+
+    def server_lookup(_server_id: str) -> None:
+        return None
+
+    store = LazyPerUserOAuthTokenStore(
+        server_lookup,
+        store_builder=build_store,
+        redis_available=redis_available,
+    )
+
+    first_fetch = asyncio.create_task(store.fetch("u", "s"))
+    await local_store.started.wait()
+    first_fetch.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_fetch
+
+    redis_available.available = True
+    second_fetch = asyncio.create_task(store.fetch("u", "s"))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert redis_store.calls == []
+
+    local_store.release.set()
+    second = await second_fetch
+
+    assert second is not None and second.access_token == "redis"
+    assert redis_store.calls == [("u", "s")]
+
+
+@pytest.mark.asyncio
 async def test_lazy_store_invalidate_builds_chain_and_delegates() -> None:
     local_store = _RecordingStore("local")
     build_calls = 0
@@ -410,3 +450,29 @@ async def test_expired_unverified_credential_never_reaches_refresh(monkeypatch):
     store = LazyPerUserOAuthTokenStore(lambda _: server, redis_available=lambda: False)
     assert await store.fetch("alice", "srv") is None
     post.assert_not_awaited()
+
+
+def test_redis_availability_reads_the_shared_usage_cache(monkeypatch) -> None:
+    from litellm.proxy import proxy_server
+    from litellm.proxy.mcp_server.outbound_credentials.per_user_oauth_store import _redis_cache_is_available
+
+    monkeypatch.setattr(proxy_server, "redis_usage_cache", object())
+    assert _redis_cache_is_available() is True
+    monkeypatch.setattr(proxy_server, "redis_usage_cache", None)
+    assert _redis_cache_is_available() is False
+
+
+def test_runtime_backend_uses_the_same_shared_usage_cache_as_the_coordinator(monkeypatch) -> None:
+    from litellm.proxy import proxy_server
+    from litellm.proxy.mcp_server.outbound_credentials import per_user_oauth_store
+
+    redis_cache = object()
+    coordinator = object()
+    monkeypatch.setattr(proxy_server, "redis_usage_cache", redis_cache)
+    monkeypatch.setattr(per_user_oauth_store, "runtime_refresh_coordinator", lambda: coordinator)
+
+    backend, actual_coordinator, uses_redis = per_user_oauth_store._runtime_backend_and_coordinator()
+
+    assert uses_redis is True
+    assert actual_coordinator is coordinator
+    assert backend is not None and backend.cache is redis_cache

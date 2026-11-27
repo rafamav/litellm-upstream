@@ -120,12 +120,14 @@ async def _post_token_endpoint(url: str, form: dict[str, str], headers: dict[str
 
 
 def _redis_cache_is_available() -> bool:
-    from litellm.proxy.proxy_server import user_api_key_cache  # noqa: PLC0415
+    from litellm.proxy.proxy_server import redis_usage_cache  # noqa: PLC0415
 
-    return user_api_key_cache.has_redis
+    return redis_usage_cache is not None
 
 
-def _runtime_backend_and_coordinator() -> tuple[TokenCacheBackend | None, RefreshCoordinator | None, bool]:
+def _runtime_backend_and_coordinator() -> tuple[
+    TokenCacheBackend | None, RefreshCoordinator[OAuthToken | None] | None, bool
+]:
     """The cross-replica cache + coordinator when Redis is wired, else ``(None, None, False)`` so the
     foundation's in-process defaults are used (a single replica needs no shared cache or lock).
     """
@@ -133,16 +135,16 @@ def _runtime_backend_and_coordinator() -> tuple[TokenCacheBackend | None, Refres
         decrypt_value_helper,
         encrypt_value_helper,
     )
-    from litellm.proxy.proxy_server import mcp_state_cache  # noqa: PLC0415
+    from litellm.proxy.proxy_server import redis_usage_cache  # noqa: PLC0415
 
     coordinator: Final = runtime_refresh_coordinator()
-    if coordinator is None:
+    if coordinator is None or redis_usage_cache is None:
         return None, None, False
     codec: Final = OAuthTokenCacheCodec(
         encrypt_value_helper,
         lambda blob: decrypt_value_helper(blob, "mcp_per_user_token", exception_type="debug"),
     )
-    backend: Final = DualCacheTokenCacheBackend(mcp_state_cache, codec)
+    backend: Final = DualCacheTokenCacheBackend(redis_usage_cache, codec)
     return backend, coordinator, True
 
 
@@ -218,11 +220,12 @@ class LazyPerUserOAuthTokenStore:
                 return await store.fetch(user_id, server_id)
 
         store, uses_redis = await self._store_for_fetch()
+        operation: Final = asyncio.ensure_future(store.fetch(user_id, server_id))
         try:
-            return await store.fetch(user_id, server_id)
+            return await asyncio.shield(operation)
         finally:
             if not uses_redis:
-                await self._finish_local_fetch()
+                self._finish_local_operation(operation)
 
     async def invalidate(self, user_id: str, server_id: str) -> None:
         """Drop the chain's cached entry for ``(user_id, server_id)`` after the credential row
@@ -257,6 +260,12 @@ class LazyPerUserOAuthTokenStore:
             if not uses_redis:
                 self._local_fetches += 1
             return store, uses_redis
+
+    def _finish_local_operation(self, operation: asyncio.Future[object]) -> None:
+        if operation.done():
+            asyncio.create_task(self._finish_local_fetch())
+            return
+        operation.add_done_callback(lambda _operation: asyncio.create_task(self._finish_local_fetch()))
 
     async def _finish_local_fetch(self) -> None:
         async with self._fetch_lock:
