@@ -179,6 +179,7 @@ def raise_classified_list_failure(
             status_code=status_code,
             www_authenticate=None if suppress_challenge else challenge,
             server_name=server_name,
+            managed_reauth=recovery_error is not None and recovery_error.tag == "unauthorized",
         ) from exc
     raise MCPServerListError(classify_list_exception(exc), server_name) from exc
 

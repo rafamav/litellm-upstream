@@ -89,10 +89,15 @@ class MCPUpstreamAuthError(Exception):
         the client originally targeted, matching the path-aware behaviour of
         ``get_passthrough_resource_metadata_url`` in ``oauth_utils.py``.
         """
+        first_route_segment: Final = request_path.lstrip("/").split("/", 1)[0] if request_path else ""
         use_aggregate_metadata: Final = (
             (self.required_scope is not None or self.managed_reauth)
             and request_path is not None
-            and (request_path.rstrip("/") == "/mcp" or request_path.startswith("/toolset/"))
+            and (
+                request_path.rstrip("/") == "/mcp"
+                or request_path.startswith("/toolset/")
+                or (self.managed_reauth and "," in first_route_segment)
+            )
         )
         requested_scope: Final = (
             " ".join(
