@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO \"LiteLLM_DeletedVerificationToken\" (\n    id, access_group_ids, agent_id, aliases, allowed_cache_controls, allowed_routes, auto_rotate, blocked,\n    budget_duration, budget_fallbacks, budget_id, budget_reset_at, config, created_at, created_by, expires,\n    key_alias, key_id, key_name, key_rotation_at, key_type, last_active, last_rotation_at, max_budget,\n    max_parallel_requests, metadata, model_max_budget, model_spend, models, object_permission_id,\n    organization_id, permissions, policies, project_id, rotation_count, rotation_interval, router_settings,\n    rpm_limit, settings_updated_at, soft_budget_cooldown, spend, team_id, token, total_spend, tpd_limit,\n    tpm_limit, updated_at, updated_by, user_id, deleted_at\n)\nSELECT gen_random_uuid()::text,\n       COALESCE(access_group_ids, '{}'), agent_id, aliases, COALESCE(allowed_cache_controls, '{}'),\n       COALESCE(allowed_routes, '{}'), auto_rotate, blocked, budget_duration, budget_fallbacks, budget_id,\n       budget_reset_at, config, created_at, created_by, expires, key_alias, key_id, key_name, key_rotation_at,\n       key_type, last_active, last_rotation_at, max_budget, max_parallel_requests, metadata, model_max_budget,\n       model_spend, COALESCE(models, '{}'), object_permission_id, organization_id, permissions,\n       COALESCE(policies, '{}'), project_id, rotation_count, rotation_interval, router_settings, rpm_limit,\n       settings_updated_at, soft_budget_cooldown, spend, team_id, token, total_spend, tpd_limit, tpm_limit,\n       updated_at, updated_by, user_id, NOW() AT TIME ZONE 'UTC'\nFROM \"LiteLLM_VerificationToken\"\nWHERE user_id = $1\n  AND team_id = $2\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8370b81ef5bda191a0299108126d81ea1797d6add10c06e0cfd3aa77ce22449c"
+}

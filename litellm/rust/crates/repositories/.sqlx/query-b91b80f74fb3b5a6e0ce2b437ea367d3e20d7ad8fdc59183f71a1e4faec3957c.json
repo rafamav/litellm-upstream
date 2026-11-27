@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT members_with_roles AS \"members_with_roles!: Json<serde_json::Value>\"\nFROM \"LiteLLM_TeamTable\"\nWHERE team_id = $1\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "members_with_roles!: Json<serde_json::Value>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "\"LiteLLM_TeamTable\"",
+            "name": "members_with_roles"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b91b80f74fb3b5a6e0ce2b437ea367d3e20d7ad8fdc59183f71a1e4faec3957c"
+}

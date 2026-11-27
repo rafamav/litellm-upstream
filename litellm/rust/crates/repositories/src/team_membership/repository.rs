@@ -2,13 +2,19 @@
 //! `get_team_membership` misses the auth cache, and the write that adds a user to a team.
 
 use super::queries::{self, TeamMembership};
-use crate::{Database, Side, database::Connections};
+use crate::{Database, MappedClaim, Side, database::Connections};
 use jiff::Timestamp;
 use litellm_db::Call;
 use serde_json::Value;
 
 const FIND_TEAM_MEMBERSHIP: Call = Call {
     call_type: "_fetch_team_membership_from_db",
+    table: None,
+    operation: None,
+};
+
+const DELETE_TEAM_MEMBER: Call = Call {
+    call_type: "team_member_delete",
     table: None,
     operation: None,
 };
@@ -28,6 +34,35 @@ pub struct NewMemberBudget {
     pub budget_reset_at: Option<Timestamp>,
     pub created_by: String,
     pub updated_by: String,
+}
+
+/// A budget of the member's own with a cap, as `resolve_member_budget_id` creates for a default team's
+/// `max_budget_in_team`, inserted in the member add's transaction. `allowed_models` is the team's default member
+/// models, left at the column's default when the team has none.
+#[derive(Clone, Debug)]
+pub struct NewCappedMemberBudget {
+    pub budget_id: String,
+    pub max_budget: f64,
+    pub allowed_models: Option<Vec<String>>,
+    pub created_by: String,
+    pub updated_by: String,
+}
+
+/// The role a roster entry gives its member, as `Member.role` takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+pub enum RosterRole {
+    #[strum(serialize = "user")]
+    User,
+    #[strum(serialize = "admin")]
+    Admin,
+}
+
+/// The budget a member joining as `add_member_as` adds them is linked to: one `add_member` takes, or a new one
+/// with a cap.
+#[derive(Clone, Copy, Debug)]
+pub enum JoinBudget<'a> {
+    Member(MemberBudget<'a>),
+    Capped(&'a NewCappedMemberBudget),
 }
 
 /// The budget a new membership is linked to.
@@ -55,6 +90,26 @@ pub enum MemberAdd {
     AlreadyMember,
     TeamMissing,
     UserMissing,
+}
+
+/// What a member removal changed: the roster before and after, the same when the roster did not list the user,
+/// the hashes of the user's keys in the team it deleted, and the JWT claims mapped to them, which went with them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemovedMember {
+    pub roster_before: Value,
+    pub roster_after: Value,
+    pub deleted_tokens: Vec<String>,
+    pub mapped_claims: Vec<MappedClaim>,
+}
+
+/// How removing a user from a team ended. Only `Removed` wrote anything.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MemberRemove {
+    Removed(Box<RemovedMember>),
+    /// Neither the roster nor the user's teams list the team, which `team_member_delete` refuses as "User not
+    /// found in team".
+    NotMember,
+    TeamMissing,
 }
 
 /// Reads and writes `LiteLLM_TeamMembership` joined to the member's `LiteLLM_BudgetTable` row.
@@ -101,16 +156,57 @@ impl TeamMembershipRepository {
             })
             .await
     }
+
+    /// [`Self::add_member`] with the member's `role` and a budget that may carry a cap, as
+    /// `add_new_user_to_default_team` adds a user created at sign-in to each team in
+    /// `default_internal_user_params.teams`, in the same transaction and lock order.
+    pub async fn add_member_as(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        role: RosterRole,
+        budget: JoinBudget<'_>,
+    ) -> Result<MemberAdd, litellm_db::Error> {
+        self.database
+            .run(UPSERT_TEAM_MEMBERSHIP, || async {
+                self.database
+                    .transaction(async |transaction| {
+                        add_member_as_once(transaction, user_id, team_id, role, budget).await
+                    })
+                    .await
+            })
+            .await
+    }
+
+    /// Removes `user_id` from `team_id` in one transaction, as `team_member_delete` does for a proxy admin: the
+    /// user's entries off the roster, the team off the user's `teams`, the membership row, and the user's keys in
+    /// the team, archived to `LiteLLM_DeletedVerificationToken` first. The member's budget row stays. It holds the
+    /// team's advisory lock, as the management endpoints do.
+    pub async fn remove_member(
+        &self,
+        user_id: &str,
+        team_id: &str,
+    ) -> Result<MemberRemove, litellm_db::Error> {
+        self.database
+            .run(DELETE_TEAM_MEMBER, || async {
+                self.database
+                    .transaction(async |transaction| {
+                        remove_member_once(transaction, user_id, team_id).await
+                    })
+                    .await
+            })
+            .await
+    }
 }
 
-/// The steps of a member add, in the lock order the management endpoints use: the team's advisory lock, then the
-/// user row.
-pub(super) async fn add_member_once(
+/// The steps every member add starts with, in the lock order the management endpoints use: the team's advisory
+/// lock, the roster check, then the user row, locked, and the team on its `teams`. The user's email, or how the add
+/// ended without writing.
+async fn claim_member(
     connections: &mut impl Connections,
     user_id: &str,
     team_id: &str,
-    budget: MemberBudget<'_>,
-) -> Result<MemberAdd, litellm_db::Error> {
+) -> Result<Result<Option<String>, MemberAdd>, litellm_db::Error> {
     connections
         .with(Side::Writer, async |db| {
             queries::lock_team(db, team_id).await
@@ -122,8 +218,8 @@ pub(super) async fn add_member_once(
         })
         .await?;
     match listed {
-        None => return Ok(MemberAdd::TeamMissing),
-        Some(true) => return Ok(MemberAdd::AlreadyMember),
+        None => return Ok(Err(MemberAdd::TeamMissing)),
+        Some(true) => return Ok(Err(MemberAdd::AlreadyMember)),
         Some(false) => {}
     }
     let locked = connections
@@ -132,13 +228,28 @@ pub(super) async fn add_member_once(
         })
         .await?;
     let Some(user_email) = locked else {
-        return Ok(MemberAdd::UserMissing);
+        return Ok(Err(MemberAdd::UserMissing));
     };
     connections
         .with(Side::Writer, async |db| {
             queries::add_team_to_user(db, user_id, team_id).await
         })
         .await?;
+    Ok(Ok(user_email))
+}
+
+/// The steps of a member add, in the lock order the management endpoints use: the team's advisory lock, then the
+/// user row.
+pub(super) async fn add_member_once(
+    connections: &mut impl Connections,
+    user_id: &str,
+    team_id: &str,
+    budget: MemberBudget<'_>,
+) -> Result<MemberAdd, litellm_db::Error> {
+    let user_email = match claim_member(connections, user_id, team_id).await? {
+        Ok(user_email) => user_email,
+        Err(ended) => return Ok(ended),
+    };
     let budget_id = match budget {
         MemberBudget::None => None,
         MemberBudget::Existing(budget_id) => Some(budget_id),
@@ -164,5 +275,136 @@ pub(super) async fn add_member_once(
     Ok(MemberAdd::Added(Box::new(AddedMember {
         membership,
         roster,
+    })))
+}
+
+/// The steps of [`TeamMembershipRepository::add_member_as`]: those of a member add, with the capped budget and the
+/// entry's role.
+pub(super) async fn add_member_as_once(
+    connections: &mut impl Connections,
+    user_id: &str,
+    team_id: &str,
+    role: RosterRole,
+    budget: JoinBudget<'_>,
+) -> Result<MemberAdd, litellm_db::Error> {
+    let user_email = match claim_member(connections, user_id, team_id).await? {
+        Ok(user_email) => user_email,
+        Err(ended) => return Ok(ended),
+    };
+    let budget_id = match budget {
+        JoinBudget::Member(MemberBudget::None) => None,
+        JoinBudget::Member(MemberBudget::Existing(budget_id)) => Some(budget_id),
+        JoinBudget::Member(MemberBudget::New(new_budget)) => {
+            connections
+                .with(Side::Writer, async |db| {
+                    queries::insert_member_budget(db, new_budget, user_id, team_id).await
+                })
+                .await?;
+            Some(new_budget.budget_id.as_str())
+        }
+        JoinBudget::Capped(new_budget) => {
+            connections
+                .with(Side::Writer, async |db| {
+                    queries::insert_capped_member_budget(db, new_budget, user_id, team_id).await
+                })
+                .await?;
+            Some(new_budget.budget_id.as_str())
+        }
+    };
+    let membership = connections
+        .with(Side::Writer, async |db| {
+            queries::insert_team_membership(db, user_id, team_id, budget_id).await
+        })
+        .await?;
+    let roster = connections
+        .with(Side::Writer, async |db| {
+            queries::append_member_as_to_roster(db, team_id, user_id, user_email.as_deref(), role)
+                .await
+        })
+        .await?;
+    Ok(MemberAdd::Added(Box::new(AddedMember {
+        membership,
+        roster,
+    })))
+}
+
+/// Whether `roster` holds an entry naming `user_id`, as `cleanup_members_with_roles` matches a removal by id.
+fn lists_user(roster: &Value, user_id: &str) -> bool {
+    roster.as_array().is_some_and(|entries| {
+        entries
+            .iter()
+            .any(|entry| entry.get("user_id").and_then(Value::as_str) == Some(user_id))
+    })
+}
+
+/// The steps of a member removal, in the order `team_member_delete` makes them under the team's advisory lock.
+pub(super) async fn remove_member_once(
+    connections: &mut impl Connections,
+    user_id: &str,
+    team_id: &str,
+) -> Result<MemberRemove, litellm_db::Error> {
+    connections
+        .with(Side::Writer, async |db| {
+            queries::lock_team(db, team_id).await
+        })
+        .await?;
+    let Some(roster_before) = connections
+        .with(Side::Writer, async |db| {
+            queries::find_roster(db, team_id).await
+        })
+        .await?
+    else {
+        return Ok(MemberRemove::TeamMissing);
+    };
+    let listed = lists_user(&roster_before, user_id);
+    let holds_team = connections
+        .with(Side::Writer, async |db| {
+            queries::user_holds_team(db, user_id, team_id).await
+        })
+        .await?
+        .unwrap_or(false);
+    if !listed && !holds_team {
+        return Ok(MemberRemove::NotMember);
+    }
+    let mapped_claims = connections
+        .with(Side::Writer, async |db| {
+            queries::member_key_claims(db, user_id, team_id).await
+        })
+        .await?;
+    let roster_after = match listed {
+        true => {
+            connections
+                .with(Side::Writer, async |db| {
+                    queries::remove_member_from_roster(db, team_id, user_id).await
+                })
+                .await?
+        }
+        false => roster_before.clone(),
+    };
+    connections
+        .with(Side::Writer, async |db| {
+            queries::remove_team_from_user(db, user_id, team_id).await
+        })
+        .await?;
+    connections
+        .with(Side::Writer, async |db| {
+            queries::delete_team_membership(db, user_id, team_id).await
+        })
+        .await?;
+    connections
+        .with(Side::Writer, async |db| {
+            queries::archive_member_keys(db, user_id, team_id).await
+        })
+        .await?;
+    let deleted_tokens = connections
+        .with(Side::Writer, async |db| {
+            queries::delete_member_keys(db, user_id, team_id).await
+        })
+        .await?;
+    Ok(MemberRemove::Removed(Box::new(RemovedMember {
+        roster_before,
+        roster_after,
+        deleted_tokens,
+        mapped_claims,
     })))
 }

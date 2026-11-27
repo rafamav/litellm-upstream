@@ -6,7 +6,8 @@ use sqlx::{PgExecutor, types::Json};
 
 use litellm_db::Error;
 
-use super::repository::NewMemberBudget;
+use super::repository::{NewCappedMemberBudget, NewMemberBudget, RosterRole};
+use crate::MappedClaim;
 use crate::budget::Budget;
 use crate::utc_timestamp::naive_utc;
 
@@ -117,6 +118,28 @@ pub(super) async fn insert_member_budget(
     Ok(())
 }
 
+/// [`insert_member_budget`] for a budget with a cap of its own.
+pub(super) async fn insert_capped_member_budget(
+    executor: impl PgExecutor<'_>,
+    budget: &NewCappedMemberBudget,
+    user_id: &str,
+    team_id: &str,
+) -> Result<(), Error> {
+    sqlx::query_file!(
+        "src/team_membership/queries/insert_capped_member_budget.sql",
+        budget.budget_id,
+        budget.max_budget,
+        budget.allowed_models.as_deref(),
+        budget.created_by,
+        budget.updated_by,
+        user_id,
+        team_id
+    )
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// The membership of `user_id` in `team_id`, inserted with `budget_id` unless the user already has one, which is
 /// left as it is.
 pub(super) async fn insert_team_membership(
@@ -153,6 +176,149 @@ pub(super) async fn append_member_to_roster(
     .fetch_one(executor)
     .await?;
     Ok(roster)
+}
+
+/// [`append_member_to_roster`] with the entry's `role`.
+pub(super) async fn append_member_as_to_roster(
+    executor: impl PgExecutor<'_>,
+    team_id: &str,
+    user_id: &str,
+    user_email: Option<&str>,
+    role: RosterRole,
+) -> Result<serde_json::Value, Error> {
+    let Json(roster) = sqlx::query_file_scalar!(
+        "src/team_membership/queries/append_member_as_to_roster.sql",
+        team_id,
+        user_id,
+        user_email,
+        <&'static str>::from(role)
+    )
+    .fetch_one(executor)
+    .await?;
+    Ok(roster)
+}
+
+/// The roster of `team_id` as stored, or `None` when the team is gone.
+pub(super) async fn find_roster(
+    executor: impl PgExecutor<'_>,
+    team_id: &str,
+) -> Result<Option<serde_json::Value>, Error> {
+    Ok(
+        sqlx::query_file_scalar!("src/team_membership/queries/find_roster.sql", team_id)
+            .fetch_optional(executor)
+            .await?
+            .map(|Json(roster)| roster),
+    )
+}
+
+/// Whether the row of `user_id` lists `team_id` among its teams, or `None` when the user is gone.
+pub(super) async fn user_holds_team(
+    executor: impl PgExecutor<'_>,
+    user_id: &str,
+    team_id: &str,
+) -> Result<Option<bool>, Error> {
+    Ok(sqlx::query_file_scalar!(
+        "src/team_membership/queries/user_holds_team.sql",
+        user_id,
+        team_id
+    )
+    .fetch_optional(executor)
+    .await?)
+}
+
+/// Drops every roster entry of `team_id` naming `user_id` and returns the roster as stored.
+pub(super) async fn remove_member_from_roster(
+    executor: impl PgExecutor<'_>,
+    team_id: &str,
+    user_id: &str,
+) -> Result<serde_json::Value, Error> {
+    let Json(roster) = sqlx::query_file_scalar!(
+        "src/team_membership/queries/remove_member_from_roster.sql",
+        team_id,
+        user_id
+    )
+    .fetch_one(executor)
+    .await?;
+    Ok(roster)
+}
+
+/// Takes `team_id` off the teams of `user_id`, when the row lists it.
+pub(super) async fn remove_team_from_user(
+    executor: impl PgExecutor<'_>,
+    user_id: &str,
+    team_id: &str,
+) -> Result<(), Error> {
+    sqlx::query_file!(
+        "src/team_membership/queries/remove_team_from_user.sql",
+        user_id,
+        team_id
+    )
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Deletes the membership row of `user_id` in `team_id`, if there is one.
+pub(super) async fn delete_team_membership(
+    executor: impl PgExecutor<'_>,
+    user_id: &str,
+    team_id: &str,
+) -> Result<(), Error> {
+    sqlx::query_file!(
+        "src/team_membership/queries/delete_team_membership.sql",
+        user_id,
+        team_id
+    )
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// The JWT claims mapped to the keys `user_id` holds in `team_id`, which go with the keys when they are deleted.
+pub(super) async fn member_key_claims(
+    executor: impl PgExecutor<'_>,
+    user_id: &str,
+    team_id: &str,
+) -> Result<Vec<MappedClaim>, Error> {
+    Ok(sqlx::query_file_as!(
+        MappedClaim,
+        "src/team_membership/queries/member_key_claims.sql",
+        user_id,
+        team_id
+    )
+    .fetch_all(executor)
+    .await?)
+}
+
+/// Copies the keys `user_id` holds in `team_id` into `LiteLLM_DeletedVerificationToken`, stamped in UTC.
+pub(super) async fn archive_member_keys(
+    executor: impl PgExecutor<'_>,
+    user_id: &str,
+    team_id: &str,
+) -> Result<(), Error> {
+    sqlx::query_file!(
+        "src/team_membership/queries/archive_member_keys.sql",
+        user_id,
+        team_id
+    )
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Deletes the keys `user_id` holds in `team_id`, their JWT mappings with them, and returns their hashes.
+pub(super) async fn delete_member_keys(
+    executor: impl PgExecutor<'_>,
+    user_id: &str,
+    team_id: &str,
+) -> Result<Vec<String>, Error> {
+    Ok(sqlx::query_file_scalar!(
+        "src/team_membership/queries/delete_member_keys.sql",
+        user_id,
+        team_id
+    )
+    .fetch_all(executor)
+    .await?)
 }
 
 #[cfg(test)]
