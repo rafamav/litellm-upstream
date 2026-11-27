@@ -86,6 +86,8 @@ pub struct Charged {
     pub key_hash: Option<String>,
     pub key_alias: Option<String>,
     pub user_id: Option<String>,
+    /// The end user the request names, whoever the caller is.
+    pub end_user_id: Option<String>,
 }
 
 /// One call as it stands.

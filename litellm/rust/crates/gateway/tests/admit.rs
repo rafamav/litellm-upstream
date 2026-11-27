@@ -12,7 +12,10 @@ use axum::{
     http::Method,
 };
 use litellm_config::{Config, Environment};
-use litellm_gateway::{StoredConfig, host::auth::AuthStore};
+use litellm_gateway::{
+    StoredConfig,
+    host::auth::{AuthStore, EndUsers, LOOKUP_DEADLINE},
+};
 use litellm_model_catalog::{CostMap, IntegrityLimits};
 use litellm_repositories::StoredObjects;
 use rstest::rstest;
@@ -212,6 +215,7 @@ impl Sent {
 )]
 #[case::pre_call_checks("pre_call_checks")]
 #[case::end_user("end_user")]
+#[case::end_user_token_database("end_user_token_database")]
 #[tokio::test(flavor = "multi_thread")]
 async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
     litellm_gateway::install_crypto_provider();
@@ -232,10 +236,10 @@ async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
     let state = match &held {
         None => state,
         Some(held) => litellm_gateway::AppState {
-            keys: Some(Arc::new(AuthStore::new(
-                keys::memory_cache(),
-                held.database(),
-            ))),
+            keys: Some(Arc::new(
+                AuthStore::new(keys::memory_cache(), held.database())
+                    .with_end_users(EndUsers::new(held.repositories(), LOOKUP_DEADLINE)),
+            )),
             ..state
         },
     };

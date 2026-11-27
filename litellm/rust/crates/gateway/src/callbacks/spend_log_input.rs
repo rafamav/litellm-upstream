@@ -32,7 +32,8 @@ const CACHE_OFF: &str = "Cache OFF";
 ///   read, so admit cannot see it, but it only reaches background Responses jobs, which this
 ///   route never serves.
 /// - `end_user_max_budget` and `window_resets`: none. `host/auth` declines any key with a team,
-///   owner, end user, budget or access group, so only the master key or a bare key is served.
+///   owner, budget or access group and any end user whose row holds a budget, so only the master
+///   key or a bare key is served, for nobody or for an end user that holds no budget.
 /// - `batch_accounting`: false. `/v1/messages` is the only route served, and it runs no batch.
 /// - `response` and `kwargs_response_cost`: none. The gateway builds no logging payload yet, and
 ///   the cost comes from `Field::Cost`, which nothing on the native route fills yet.
@@ -53,6 +54,7 @@ enum SpendLogInput<'a> {
 struct Identity<'a> {
     token: Option<&'a str>,
     user_id: Option<&'a str>,
+    end_user_id: Option<&'a str>,
     key_alias: Option<&'a str>,
 }
 
@@ -95,6 +97,7 @@ struct Metadata<'a> {
     user_api_key_hash: Option<&'a str>,
     user_api_key_alias: Option<&'a str>,
     user_api_key_user_id: Option<&'a str>,
+    user_api_key_end_user_id: Option<&'a str>,
     user_api_key_request_route: &'static str,
     model_group: &'a str,
     model_info: ModelInfo<'a>,
@@ -175,6 +178,7 @@ pub(super) fn success(served: &Served<'_>) -> Option<serde_json::Value> {
             user_api_key_hash: charged.key_hash.as_deref(),
             user_api_key_alias: charged.key_alias.as_deref(),
             user_api_key_user_id: charged.user_id.as_deref(),
+            user_api_key_end_user_id: charged.end_user_id.as_deref(),
             user_api_key_request_route: served.route,
             model_group: &served.call.model_group,
             model_info: ModelInfo {
@@ -200,6 +204,7 @@ pub(super) fn success(served: &Served<'_>) -> Option<serde_json::Value> {
         identity: Identity {
             token: charged.key_hash.as_deref(),
             user_id: charged.user_id.as_deref(),
+            end_user_id: charged.end_user_id.as_deref(),
             key_alias: charged.key_alias.as_deref(),
         },
         call_type: served.call_type.into(),
@@ -265,7 +270,7 @@ mod tests {
         Charged {
             key_hash: Some("a".repeat(64)),
             key_alias: Some("ci".to_owned()),
-            user_id: None,
+            ..Charged::default()
         }
     }
 
@@ -382,13 +387,37 @@ mod tests {
     fn the_master_keys_row_is_logged_under_pythons_alias_for_it() {
         let charged = Charged {
             key_hash: Some("litellm_proxy_master_key".to_owned()),
-            key_alias: None,
             user_id: Some("default_user_id".to_owned()),
+            ..Charged::default()
         };
         let row = row(&input(&charged, &call(None), false));
         assert_eq!(
             (row.api_key.as_str(), row.user.as_str()),
             ("litellm_proxy_master_key", "default_user_id")
+        );
+    }
+
+    #[rstest]
+    #[case::an_end_user(Some("eu-1"), "eu-1")]
+    #[case::nobody(None, "")]
+    fn a_served_call_is_charged_to_and_logged_under_the_end_user_it_names(
+        #[case] end_user_id: Option<&str>,
+        #[case] logged: &str,
+    ) {
+        let charged = Charged {
+            end_user_id: end_user_id.map(str::to_owned),
+            ..key()
+        };
+        let input = input(&charged, &call(None), false);
+        let Parsed::Success(success) = serde_json::from_value(input.clone()).unwrap() else {
+            panic!("a served call is a success")
+        };
+        assert_eq!(
+            (
+                success.identity.end_user_id.as_deref(),
+                row(&input).end_user.as_str()
+            ),
+            (end_user_id, logged)
         );
     }
 }

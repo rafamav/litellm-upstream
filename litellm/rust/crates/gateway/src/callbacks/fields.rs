@@ -46,19 +46,22 @@ pub enum Unwritable {
 }
 
 /// Who `identity` is charged as: a key by the hash its row is stored under, its alias and its
-/// owner, and the master key by Python's alias for it and the proxy admin. Native keys name no
-/// team, organization, project or end user.
+/// owner, and the master key by Python's alias for it and the proxy admin, each with the end user
+/// the request names. Native keys name no team, organization or project.
 pub(super) fn charged(identity: &Authenticated<NativeRows>) -> Charged {
+    let end_user_id = identity.end_user.end_user_id.clone();
     match &identity.credential {
         Credential::MasterKey => Charged {
             key_hash: Some(MASTER_KEY_ALIAS.to_owned()),
             key_alias: None,
             user_id: Some(PROXY_ADMIN_NAME.to_owned()),
+            end_user_id,
         },
         Credential::Key { key } => Charged {
             key_hash: identity.hash().map(ToString::to_string),
             key_alias: key.alias().map(str::to_owned),
             user_id: key.record().user_id.clone(),
+            end_user_id,
         },
     }
 }
@@ -394,6 +397,17 @@ mod tests {
 
     fn keys() -> Map<String, Value> {
         Map::from_iter([("max_tokens".to_owned(), json!(5))])
+    }
+
+    #[rstest]
+    fn a_caller_is_charged_with_the_end_user_its_request_names() {
+        let end_user = litellm_gateway_auth_core::record::EndUserRecord {
+            end_user_id: Some("eu-1".to_owned()),
+            found: false,
+        };
+        let caller = Authenticated::from(litellm_gateway_auth_core::Caller::master_key(end_user));
+
+        assert_eq!(charged(&caller).end_user_id.as_deref(), Some("eu-1"));
     }
 
     #[rstest]

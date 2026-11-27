@@ -12,7 +12,9 @@ use litellm_gateway_auth_core::{
     authz::ModelList,
 };
 use litellm_python_compat::{Value, datetime::IsoDateTime, json};
-use litellm_redis_store::auth_cache::{Bag, KeyEntry, Lists, ModelRegion, ObjectPermissionEntry};
+use litellm_redis_store::auth_cache::{
+    Bag, BudgetEntry, KeyEntry, Lists, ModelRegion, ObjectPermissionEntry,
+};
 use serde::Deserialize;
 
 use crate::callbacks::parallel_request_limiter::{KeyLimits, ModelLimits};
@@ -58,7 +60,8 @@ carried_when_held!(
     IsoDateTime,
     LitellmRole,
     ModelRegion,
-    ObjectPermissionEntry
+    ObjectPermissionEntry,
+    BudgetEntry
 );
 
 impl<T> Carried for Vec<T> {

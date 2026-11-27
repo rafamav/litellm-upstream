@@ -27,7 +27,10 @@ use crate::{
     callbacks::parallel_request_limiter,
     db,
     gateway_requests::GatewayRequests,
-    host::{self, NativeRows, auth::AuthStore},
+    host::{
+        self, NativeRows,
+        auth::{AuthStore, EndUsers, LOOKUP_DEADLINE},
+    },
     license::build_license,
     periodic::{self, PeriodicJob},
 };
@@ -37,6 +40,9 @@ pub struct AppState {
     pub inference: Arc<Gateway>,
     pub redis: RedisClients,
     pub database: Option<Pools>,
+    /// Whether the proxy reads a database the gateway opens no pool on, one it signs in to with
+    /// a token, so having no pool does not mean the proxy holds no rows.
+    pub database_unread: bool,
     /// Where a virtual key is read from: the auth cache in front of the proxy's database. `None`
     /// without a database.
     pub keys: Option<Arc<AuthStore>>,
@@ -79,6 +85,8 @@ impl AppState {
         let routing = crate::redis::routing(&redis, environment);
         let counters = parallel_request_limiter::counters(redis.coordination.clone());
         let connected = db::connect(config, &resources.secrets).await?;
+        let database_unread = matches!(connected, db::Connected::Unread);
+        let connected = connected.pools();
         let spend_logs = connected
             .as_ref()
             .map(|(_, repositories)| Arc::new(SpendLog::start(repositories, &redis, &variables)));
@@ -114,6 +122,7 @@ impl AppState {
             inference,
             redis,
             database,
+            database_unread,
             keys,
             entitlements,
             key_limiter,
@@ -205,6 +214,7 @@ fn gateway_requests_flush(
 /// `enable_redis_auth_cache` attaches it. Every pod's evictions reach the memory whenever a
 /// coordination Redis carries them, as Python subscribes with the flag on or off.
 pub(crate) fn keys(config: &Config, redis: &RedisClients, database: Database) -> AuthStore {
+    let end_users = EndUsers::new(database.clone(), LOOKUP_DEADLINE);
     let database = KeyDatabase::new(
         Arc::new(KeyRepository::new(database.clone())),
         Arc::new(ObjectPermissionRepository::new(database)),
@@ -213,7 +223,7 @@ pub(crate) fn keys(config: &Config, redis: &RedisClients, database: Database) ->
     if let Some(client) = &redis.coordination {
         hear_evictions(&cache, client);
     }
-    AuthStore::new(cache, database)
+    AuthStore::new(cache, database).with_end_users(end_users)
 }
 
 /// Drops from this process's memory every key a pod evicts, Python or native, for as long as

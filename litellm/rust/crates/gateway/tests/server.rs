@@ -72,6 +72,7 @@ fn without_stores(inference: Inference) -> AppState {
         inference: inference.gateway,
         redis: RedisClients::default(),
         database: None,
+        database_unread: false,
         keys: None,
         spend_logs: None,
         entitlements: Arc::new(Entitlements::Community),

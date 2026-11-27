@@ -98,6 +98,20 @@ impl Held {
         statements.execute(self.postgres.pool()).await.unwrap();
     }
 
+    /// A transaction that holds `table` locked, so every read of it waits until it ends.
+    pub async fn locking(&self, table: &str) -> sqlx::Transaction<'static, sqlx::Postgres> {
+        let mut transaction = self.postgres.pool().begin().await.unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "Fixture statements are outside the compile-checked query set"
+        )]
+        let statement = sqlx::query(sqlx::AssertSqlSafe(format!(
+            r#"LOCK TABLE "{table}" IN ACCESS EXCLUSIVE MODE"#
+        )));
+        statement.execute(&mut *transaction).await.unwrap();
+        transaction
+    }
+
     /// Where a config names this database, as `general_settings.database_url`.
     pub fn url(&self) -> &str {
         self.postgres.url()
@@ -126,10 +140,15 @@ pub fn memory_cache() -> Arc<AuthCache> {
 
 /// A database nothing listens on, whose every read fails.
 pub fn unreachable() -> KeyDatabase {
-    key_database(connected(
+    key_database(unreachable_repositories())
+}
+
+/// What a repository runs its queries on a database nothing listens on with.
+pub fn unreachable_repositories() -> Database {
+    connected(
         "postgres://postgres:postgres@127.0.0.1:1/postgres",
         Arc::<KeyReads>::default(),
-    ))
+    )
 }
 
 fn key_database(database: Database) -> KeyDatabase {
